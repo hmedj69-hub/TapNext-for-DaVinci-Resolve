@@ -25,7 +25,6 @@ else
 fi
 
 echo "[2/8] Python 3.11 (local)…"
-if [ -x "$PY" ] && ! "$PY" -c "import tkinter" 2>/dev/null; then rm -rf "$VENV"; fi
 [ -x "$PY" ] || "$UV" venv "$VENV" --python 3.11 --python-preference only-managed --seed
 
 echo "[3/8] PyTorch…"
@@ -39,8 +38,8 @@ else
   "$UV" pip install --python "$PY" torch torchvision --index-url https://download.pytorch.org/whl/cpu
 fi
 
-echo "[4/8] OpenCV, ffmpeg et dépendances…"
-"$UV" pip install --python "$PY" opencv-python numpy einops tqdm imageio-ffmpeg
+echo "[4/8] OpenCV, ffmpeg, interface Qt et dépendances…"
+"$UV" pip install --python "$PY" opencv-python numpy einops tqdm imageio-ffmpeg PySide6-Essentials
 
 echo "[5/8] TAPNext++ (google-deepmind/tapnet)…"
 "$UV" pip install --python "$PY" --no-deps --reinstall-package tapnet \
@@ -51,10 +50,10 @@ echo "[6/8] Modèle TAPNext++ 512 px (~2,5 Go, une seule fois)…"
 "$PY" -c "import tap_resolve_tool as t; print('      ', t.ensure_checkpoint(None, 512))"
 
 echo "[7/8] Vérification…"
-"$PY" -c "import tkinter, torch, cv2, imageio_ffmpeg; from tapnet.tapnextpp.votsp2026.model import TAPNextPP; c=torch.cuda.is_available(); print('       PyTorch', torch.__version__, '| CUDA :', c, '|', torch.cuda.get_device_name(0) if c else 'CPU'); print('       OpenCV', cv2.__version__, '| ffmpeg OK | Tk OK | TAPNext++ OK')"
+"$PY" -c "import PySide6, torch, cv2, imageio_ffmpeg; from tapnet.tapnextpp.votsp2026.model import TAPNextPP; c=torch.cuda.is_available(); print('       PyTorch', torch.__version__, '| CUDA :', c, '|', torch.cuda.get_device_name(0) if c else 'CPU'); print('       OpenCV', cv2.__version__, '| ffmpeg OK | Qt OK | TAPNext++ OK')"
 echo "[8/8] Intégration dans DaVinci Resolve (Workspace > Scripts)…"
 "$PY" resolve_plugin/install_resolve_plugin.py || echo "      ATTENTION : intégration Resolve impossible, voir README."
-chmod +x TAPNext_Resolve.sh 2>/dev/null || true
+chmod +x TAPNext_Studio.sh 2>/dev/null || true
 echo
-echo "Installation terminée. Interface : ./TAPNext_Resolve.sh"
+echo "Installation terminée. Application : ./TAPNext_Studio.sh"
 echo "Dans DaVinci Resolve : Workspace > Scripts > TAPNext_Tracker"

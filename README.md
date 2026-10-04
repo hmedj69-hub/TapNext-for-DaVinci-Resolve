@@ -1,72 +1,64 @@
-# TAPNext++ pour DaVinci Resolve
+# TAPNext Studio pour DaVinci Resolve
 
-Outil Python autonome qui suit des points dans une vidéo (MP4/MOV, 1080p ou 4K,
-jusqu'à 1024 images et plus) avec **TAPNext++** de Google DeepMind
-([`google-deepmind/tapnet`](https://github.com/google-deepmind/tapnet)), puis produit :
-
-| Sortie | Fichier | Utilisation dans Resolve |
-|---|---|---|
-| Matte alpha N&B (à la résolution source) | `<clip>_matte.mov` (ProRes 422 HQ) | Page **Color** → *External Matte* |
-| Trajectoires | `<clip>_tracks.csv` / `<clip>_tracks.json` | Analyse, scripts, autres logiciels |
-| Nœud Transform de stabilisation | `<clip>_fusion_stabilize.setting` | Page **Fusion** (glisser-déposer ou Ctrl+V) |
-| Nœud Transform de match-move | `<clip>_fusion_matchmove.setting` | Page **Fusion**, pour accrocher un élément |
-| Vidéo de contrôle (option `--preview`) | `<clip>_preview.mp4` | Vérification visuelle |
+Tracking de points avec **TAPNext++** de Google DeepMind ([`google-deepmind/tapnet`](https://github.com/google-deepmind/tapnet)) sur des plans 1080p ou 4K de 1024 images et plus. Le résultat sort en **mattes alpha** pour la page Color et en **nœuds Fusion** pour la stabilisation ou le match-move.
 
 ```
-tap_resolve_tool.py   ← script principal (tracking, mattes, exports)
-tap_gui.py            ← interface graphique
+tap_studio.py         ← TAPNext Studio : application visuelle (recommandé)
+tap_resolve_tool.py   ← moteur (tracking, mattes, exports) + ligne de commande
 fusion_export.py      ← CSV → nœuds Fusion (sans dépendance ; fonctionne aussi DANS Resolve)
-INSTALLER_Windows.bat, install.sh, TAPNext_Resolve.bat/.sh, TAPNext_CLI.bat
-requirements.txt
+resolve_plugin/       ← script Resolve « Workspace → Scripts → TAPNext_Tracker »
+INSTALLER_Windows.bat, install.sh, TAPNext_Studio.bat/.sh, TAPNext_CLI.bat
 ```
 
 ---
 
-## ⚡ Installation en un clic (recommandé)
+## ⚡ Installation en un clic
 
 **Windows** (RTX 3080 Laptop) :
 
-1. Téléchargez le dépôt (bouton **Code → Download ZIP** sur GitHub) et décompressez-le, par exemple dans `C:\TAPNext`. Évitez les dossiers synchronisés OneDrive.
-2. Double-cliquez sur **`INSTALLER_Windows.bat`**. Si Windows SmartScreen s'affiche : *Informations complémentaires → Exécuter quand même*.
-   Aucun prérequis : le script installe Python 3.11, PyTorch CUDA, TAPNext++, OpenCV et ffmpeg, puis télécharge le modèle (~5 Go au total, environ 10 à 20 min). **Tout reste dans ce dossier** : le système et une éventuelle autre installation de Python ne sont pas touchés. Si l'installation est interrompue, relancez le script : il reprend où il s'était arrêté.
-3. Double-cliquez sur **`TAPNext_Resolve.bat`** ou sur le raccourci **TAPNext++ Resolve** créé sur le Bureau. L'interface graphique s'ouvre : choisissez la vidéo, réglez les paramètres, cliquez sur **Lancer**.
-   - Vous pouvez aussi glisser une vidéo sur `TAPNext_Resolve.bat` : elle est pré-remplie.
-   - `TAPNext_CLI.bat` donne accès à la ligne de commande. Glisser une vidéo dessus lance un traitement avec les réglages par défaut.
+1. Téléchargez le dépôt (bouton **Code → Download ZIP** sur GitHub) et décompressez-le dans un dossier **sans accents**, par exemple `C:\TAPNext`. Évitez aussi les dossiers synchronisés OneDrive.
+2. Double-cliquez sur **`INSTALLER_Windows.bat`**. Si SmartScreen s'affiche : *Informations complémentaires → Exécuter quand même*.
+   Aucun prérequis : le script installe Python 3.11, PyTorch CUDA, TAPNext++, OpenCV, ffmpeg et Qt, puis télécharge le modèle (~5 Go au total, environ 10 à 20 min). Il ajoute enfin le script dans DaVinci Resolve. **Tout reste dans ce dossier.** Si l'installation est interrompue, relancez le script : il reprend où il s'était arrêté.
+3. C'est prêt :
+   - **depuis Resolve** : **Workspace → Scripts → TAPNext_Tracker** (redémarrez Resolve s'il était ouvert) ;
+   - **ou seul** : double-clic sur **`TAPNext_Studio.bat`** ou sur le raccourci **TAPNext Studio** du Bureau.
 
-4. **Dans DaVinci Resolve** (redémarrez-le s'il était ouvert) : placez la tête de lecture sur un clip, puis **Workspace → Scripts → TAPNext_Tracker**. Voir la section [Intégration dans DaVinci Resolve](#-intégration-dans-davinci-resolve).
+**Linux / macOS** : `./install.sh`, puis `./TAPNext_Studio.sh`. Sur macOS, il n'y a pas de CUDA : l'outil tourne sur CPU.
 
-**Linux / macOS** : `./install.sh`, puis `./TAPNext_Resolve.sh`. Sur macOS, il n'y a pas de CUDA : l'outil tourne sur CPU.
-
-Pour désinstaller, supprimez le dossier, ainsi que le raccourci du Bureau.
-
-| Fichier | Rôle |
-|---|---|
-| `INSTALLER_Windows.bat` / `install.sh` | Installation automatique (via [uv](https://github.com/astral-sh/uv)) |
-| `TAPNext_Resolve.bat` / `.sh` | Interface graphique (`tap_gui.py`) |
-| `TAPNext_CLI.bat` | Ligne de commande |
-| `resolve_plugin/TAPNext_Tracker.lua` | Script intégré à Resolve (installé automatiquement) |
-
-> Pourquoi pas un seul `.exe` ? PyTorch avec CUDA pèse à lui seul ~3 Go, et le modèle 2,5 Go. Un exécutable unique dépasserait 5 Go, serait lent à démarrer et souvent bloqué par les antivirus. L'installateur produit le même résultat, mais il est réparable et peut être mis à jour.
+> Pourquoi pas un seul `.exe` ? PyTorch avec CUDA pèse ~3 Go et le modèle 2,5 Go. Un exécutable unique dépasserait 5 Go et serait souvent bloqué par les antivirus. L'installateur produit le même résultat, mais il est réparable et peut être mis à jour.
 
 ---
 
-## 🎬 Intégration dans DaVinci Resolve
+## 🎬 Utilisation depuis DaVinci Resolve
 
-L'installateur ajoute un script Lua dans le menu **Workspace → Scripts → TAPNext_Tracker**. Il est disponible sur toutes les pages et fonctionne sans Python côté Resolve, car Resolve exécute le Lua nativement.
+1. Placez la tête de lecture sur le clip à traiter, dans la page Edit ou Color.
+2. **Workspace → Scripts → TAPNext_Tracker**. Une petite fenêtre s'ouvre. Choisissez si la matte doit être attachée au clip et si un nœud Fusion doit être ajouté (Stabiliser ou Match-move).
+3. **Ouvrir dans TAPNext Studio** : le clip s'ouvre dans Studio. La plage de suivi est limitée à la partie utilisée dans la timeline.
+4. Dans Studio, travaillez comme décrit ci-dessous, puis cliquez sur **Exporter et envoyer à Resolve**.
+5. De retour dans Resolve, automatiquement :
+   - la **matte** est attachée au clip. Dans la page **Color** : clic droit dans l'éditeur de nœuds → **Add Matte**, puis reliez la sortie bleue (Key) à l'entrée Key du nœud de correction. Ce câblage reste manuel, car l'API de Resolve ne permet pas de connecter les nœuds de la page Color ;
+   - le **nœud Fusion** est ajouté dans la comp du clip, avec des images-clés calées sur la numérotation de la comp. En mode Stabiliser, il est directement inséré avant `MediaOut1`.
 
-1. Dans la page **Edit** ou **Color**, placez la tête de lecture sur le clip à traiter.
-2. Ouvrez **Workspace → Scripts → TAPNext_Tracker**. Une fenêtre de réglages s'ouvre : mode des points (grille ou clic sur l'image), taille et fusion des blobs, réaction au mouvement, fondus, résolution du modèle, nœud Fusion.
-   La plage d'images est pré-remplie avec la partie du clip utilisée dans la timeline. Seule cette partie est suivie, ce qui va beaucoup plus vite que de traiter le média entier.
-3. Cliquez sur **Lancer le tracking**. Le moteur tourne en arrière-plan, et la fenêtre affiche la progression et le journal. Pour annuler, fermez la fenêtre « TAPNext++ » réduite dans la barre des tâches.
-4. À la fin, le script fait automatiquement :
-   - **Matte** : elle est attachée au clip dans le Media Pool (*clip matte*). Dans la page **Color**, faites clic droit dans l'éditeur de nœuds → **Add Matte**, puis reliez la sortie bleue à l'entrée Key du nœud de correction. Cette dernière étape reste manuelle, car l'API de Resolve ne permet pas de câbler les nœuds de la page Color.
-   - **Fusion** (si demandé) : le nœud est ajouté dans la comp Fusion du clip, avec des images-clés calées sur la numérotation de la comp. En mode **Stabiliser**, il est directement inséré avant `MediaOut1`. En mode **Match-move**, il est ajouté sans connexion : branchez votre élément dessus.
-5. Les fichiers (matte, CSV, journal, `.setting`) sont rangés dans un dossier `TAPNext/` à côté du média source. Si ce dossier n'est pas accessible en écriture, ils vont dans `output/` du dossier de l'outil.
+Gardez la fenêtre du script ouverte pendant que vous travaillez dans Studio : c'est elle qui récupère les résultats.
 
-Remarques :
-- Si vous déplacez le dossier de l'outil, relancez `INSTALLER_Windows.bat`, ou bien `.venv\Scripts\python resolve_plugin\install_resolve_plugin.py`. Le chemin peut aussi être corrigé dans le champ « Dossier de l'outil » de la fenêtre.
-- Pourquoi un script et pas un effet OFX ? Un effet OFX calcule chaque image indépendamment, et souvent dans le désordre. TAPNext++ doit au contraire lire la séquence dans l'ordre, en gardant une mémoire d'une image à l'autre, et il a besoin de PyTorch et du GPU. L'approche « script + moteur externe » est celle qu'utilisent la plupart des outils d'IA pour Resolve.
-- Correspondance des images Fusion : l'image source *f* devient l'image de comp *f − in_point + RenderStart*. Si votre comp utilise une autre numérotation, le fichier `.setting` peut être régénéré avec `fusion_export.py --frame-offset`.
+---
+
+## 🖥️ TAPNext Studio, pas à pas
+
+| Étape | Ce que vous faites | Ce qui se passe |
+|---|---|---|
+| **① Placer les points** | Allez sur une image où le sujet est bien visible et **entourez-le** avec l'outil **Zone (lasso)** ou **Zone (rectangle)**. | La zone se remplit automatiquement de points (80 par défaut) placés sur les **détails texturés**, ceux que TAPNext++ suit le mieux, en évitant les aplats. L'outil **Point** pose un point précis. **Clic droit** supprime un point, **Ctrl+Z** annule. Vous pouvez poser des points sur plusieurs images différentes. |
+| **② Suivre** | Réglez Début/Fin (touches **I**/**O**), puis cliquez sur **Lancer le suivi**. | Chaque point est suivi **vers l'avant et vers l'arrière** depuis l'image où il a été posé. Le **contrôle aller-retour** re-suit chaque piste à l'envers : si elle ne revient pas à son point de départ, elle est **coupée à l'image exacte où elle a décroché**. Les masques ne « glissent » donc plus sur le décor. Si vous ajoutez des points ensuite, seuls les nouveaux sont suivis. |
+| **③ Vérifier** | **Espace** pour lire, **←/→** image par image, molette pour zoomer, clic milieu pour se déplacer. | Les points s'affichent avec leurs **traînées**. Un point creux et gris est occulté. Un point qui a mal suivi se supprime d'un clic droit, sans relancer le suivi. |
+| **④ Matte** | Vue **Image + matte** ou **Matte seule**, puis réglez rayon, fusion, seuil, douceur, réaction au mouvement et fondus. | Le rendu est **instantané** et ne relance pas le suivi. Les blobs fusionnent en une forme continue qui épouse le sujet. |
+| **⑤ Exporter** | Choisissez dossier, format (ProRes, DNxHR, H.264, PNG), données et nœuds Fusion, puis **Exporter**. | La matte est rendue en pleine résolution (1080p ou 4K), et le CSV, le JSON et les fichiers `.setting` sont écrits. |
+
+Raccourcis : **Espace** lecture · **←/→** image · **I/O** début/fin · **F** cadrer · **Z** lasso · **R** rectangle · **A** point · **Ctrl+Z** annuler · **Ctrl+O** ouvrir.
+
+Conseils pour un suivi de qualité :
+- Posez les points sur une image **nette**, où le sujet est bien visible. Si le sujet change beaucoup d'aspect au cours du plan, ajoutez une seconde zone sur une autre image.
+- Gardez **Précision maximale (512 px)** et le **contrôle aller-retour**. Le contrôle double le temps de calcul, mais il élimine les pistes qui décrochent.
+- Entourez **le sujet seul**. Des points posés sur le fond suivent le fond.
 
 ---
 
@@ -146,6 +138,8 @@ Les valeurs par défaut sont regroupées dans le dictionnaire `DEFAULTS`, en hau
 | | `--checkpoint` | auto | Chemin du `.pt`/`.ckpt` |
 | | `--fp16-weights` | off | Poids en float16 : ~0,5 Go de VRAM au lieu de ~1 Go |
 | | `--points-per-batch` | `512` | Nombre de points traités ensemble. À baisser si la VRAM manque |
+| | `--verify` | off | Contrôle aller-retour : coupe les pistes qui décrochent (environ 2× plus long) |
+| | `--frames-per-step` | 8 (GPU) | Images envoyées ensemble au modèle (même résultat, plus rapide) |
 | | `--use-certainty` | off | Visibilité × certitude de position : plus strict, moins de faux « visible » |
 | | `--device` | `cuda` | `cuda` ou `cpu` |
 | Points | `--grid N` | `10` | Grille N×N (utilisée si aucun point n'est fourni) |
@@ -155,7 +149,7 @@ Les valeurs par défaut sont regroupées dans le dictionnaire `DEFAULTS`, en hau
 | | `--pick` | off | Sélection à la souris (clic gauche ajoute, clic droit retire, Entrée valide) |
 | Temps | `--start-frame` | `0` | Image où les points sont définis |
 | | `--end-frame` | `-1` | Dernière image suivie (-1 = fin) |
-| | `--backward` | off | Suit aussi de `start-frame` jusqu'à l'image 0 |
+| | `--backward` | off | Suit aussi de `start-frame` jusqu'à l'image 0 (suivi bidirectionnel) |
 | Post-traitement | `--smooth-sigma` | `1.0` | Lissage temporel des trajectoires (en images), pondéré par la visibilité |
 | | `--vis-threshold` | `0.5` | Seuil de visibilité |
 | | `--fade-in` / `--fade-out` | `6` / `8` | Durée des fondus d'apparition et de disparition (images) |
@@ -177,7 +171,7 @@ Les valeurs par défaut sont regroupées dans le dictionnaire `DEFAULTS`, en hau
 
 ### Fonctionnement
 
-1. **Tracking** : la vidéo est lue en flux (aucune image 4K n'est gardée en mémoire). Chaque image est réduite en `input_res × input_res` avec `INTER_AREA` (bon anti-aliasing depuis la 4K), puis passée à TAPNext++ en mode en ligne : un état récurrent est conservé d'une image à l'autre, et l'inférence se fait en fp16. Les prédictions sont dans l'espace modèle 256×256 et sont remises à l'échelle en pixels source. La visibilité est la probabilité `sigmoid(visible_logits)` donnée par le modèle.
+1. **Tracking** : chaque image est réduite en `input_res × input_res` avec `INTER_AREA` (bon anti-aliasing depuis la 4K) et gardée en mémoire sous cette forme réduite. Elle est ensuite passée à TAPNext++ en mode en ligne : un état récurrent est conservé d'une image à l'autre, les images sont envoyées par paquets de 8 sur GPU, et l'inférence se fait en fp16. Un point posé sur l'image *k* est suivi de *k* vers la fin, puis de *k* vers le début (séquence inversée). Le contrôle aller-retour re-suit chaque piste en sens inverse depuis sa dernière position fiable et localise l'image où les deux sens divergent : la piste y est coupée. Les prédictions sont dans l'espace modèle 256×256 et sont remises à l'échelle en pixels source. La visibilité est la probabilité `sigmoid(visible_logits)` donnée par le modèle.
 2. **Post-traitement** : lissage gaussien pondéré par la visibilité, vitesse `v = √(dx² + dy²)` par différence centrée, et enveloppe d'opacité. L'enveloppe suit la visibilité avec une vitesse limitée (`1/fade_in` en montée, `1/fade_out` en descente) : on obtient des fondus réguliers, sans clignotement. Pendant une occultation, le blob reste à la dernière position fiable.
 3. **Mattes (metaballs)** : chaque point dessine un cercle ou une ellipse. Le calque est flouté (flou gaussien, σ = `merge × radius`), puis seuillé avec un *smoothstep*. Les blobs proches se rejoignent en un seul masque fluide. L'opacité des fondus vient d'une convolution normalisée, ce qui garde un bord net quand les points sont pleinement visibles. Le champ est calculé en 1080p puis interpolé avant le seuil : les bords restent nets en 4K.
 4. **Fusion** : pour chaque image, une similitude 2D (translation, rotation, échelle) est ajustée par moindres carrés pondérés, avec rejet des points aberrants, par rapport à l'image où les points ont été définis. Le résultat est écrit comme keyframes `Center`, `Pivot`, `Angle` et `Size` d'un nœud `Transform`.
@@ -186,7 +180,7 @@ Les valeurs par défaut sont regroupées dans le dictionnaire `DEFAULTS`, en hau
 
 - Poids : ~245 M paramètres, soit ~1 Go en fp32 et ~0,5 Go avec `--fp16-weights`. L'inférence est en fp16 (autocast). En 512 px avec quelques centaines de points, la VRAM reste nettement sous 8 Go. Le pic réel est affiché en fin de tracking.
 - En cas d'erreur *CUDA out of memory* : `--points-per-batch 128`, puis `--fp16-weights`, puis `--input-res 256`.
-- RAM : seul `--backward` met des images en cache, et uniquement en version réduite (~0,8 Mo par image en 512).
+- RAM : les images sont gardées réduites, soit ~0,8 Mo par image en 512 (~800 Mo pour 1024 images). Studio garde en plus un aperçu JPEG (~0,1 Mo par image).
 - Le modèle a été affiné sur des séquences de 1024 images. Il continue de fonctionner au-delà, mais pour des plans très longs il vaut mieux découper en segments.
 
 ### Format du CSV

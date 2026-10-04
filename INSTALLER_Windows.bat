@@ -43,12 +43,7 @@ echo       OK
 
 REM ------------------------------------------------------------ 2. Python
 echo [2/8] Python 3.11 (local, n'affecte pas le systeme)...
-if not exist "%PY%" goto :py_make
-REM Environnement existant sans Tk (ancienne installation) : on le recree
-"%PY%" -c "import tkinter" >nul 2>&1
-if not errorlevel 1 goto :py_ok
-rmdir /s /q "%VENV%"
-:py_make
+if exist "%PY%" goto :py_ok
 "%UV%" venv "%VENV%" --python 3.11 --python-preference only-managed --seed
 if errorlevel 1 goto :fail
 :py_ok
@@ -71,8 +66,8 @@ echo       pilote NVIDIA puis relancez ce script si vous avez une carte RTX.
 if errorlevel 1 goto :fail
 
 REM ------------------------------------------------------- 4. Dependances
-echo [4/8] OpenCV, ffmpeg et autres dependances...
-"%UV%" pip install --python "%PY%" opencv-python numpy einops tqdm imageio-ffmpeg
+echo [4/8] OpenCV, ffmpeg, interface Qt et autres dependances...
+"%UV%" pip install --python "%PY%" opencv-python numpy einops tqdm imageio-ffmpeg PySide6-Essentials
 if errorlevel 1 goto :fail
 
 REM ---------------------------------------------------------- 5. TAPNext++
@@ -91,7 +86,7 @@ if errorlevel 1 goto :fail
 
 REM ------------------------------------------------------- 7. Verification
 echo [7/8] Verification...
-"%PY%" -c "import tkinter, torch, cv2, imageio_ffmpeg; from tapnet.tapnextpp.votsp2026.model import TAPNextPP; c=torch.cuda.is_available(); print('       PyTorch', torch.__version__, '| CUDA :', c, '|', torch.cuda.get_device_name(0) if c else 'CPU'); print('       OpenCV', cv2.__version__, '| ffmpeg OK | Tk OK | TAPNext++ OK')"
+"%PY%" -c "import PySide6, torch, cv2, imageio_ffmpeg; from tapnet.tapnextpp.votsp2026.model import TAPNextPP; c=torch.cuda.is_available(); print('       PyTorch', torch.__version__, '| CUDA :', c, '|', torch.cuda.get_device_name(0) if c else 'CPU'); print('       OpenCV', cv2.__version__, '| ffmpeg OK | Qt OK | TAPNext++ OK')"
 if errorlevel 1 goto :fail
 
 REM ------------------------------------------------ 8. Integration Resolve
@@ -101,15 +96,15 @@ if errorlevel 1 echo       ATTENTION : integration Resolve impossible, voir READ
 
 REM Raccourci sur le Bureau
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$s=(New-Object -ComObject WScript.Shell).CreateShortcut([Environment]::GetFolderPath('Desktop')+'\TAPNext++ Resolve.lnk');" ^
-  "$s.TargetPath='%ROOT%TAPNext_Resolve.bat'; $s.WorkingDirectory='%ROOT%'; $s.IconLocation='%SystemRoot%\System32\imageres.dll,18'; $s.Save()" >nul 2>&1
+  "$s=(New-Object -ComObject WScript.Shell).CreateShortcut([Environment]::GetFolderPath('Desktop')+'\TAPNext Studio.lnk');" ^
+  "$s.TargetPath='%ROOT%TAPNext_Studio.bat'; $s.WorkingDirectory='%ROOT%'; $s.IconLocation='%SystemRoot%\System32\imageres.dll,18'; $s.Save()" >nul 2>&1
 
 echo.
 echo  ============================================================
 echo    Installation terminee !
-echo    - Double-cliquez sur "TAPNext_Resolve.bat" (ou le raccourci
-echo      "TAPNext++ Resolve" du Bureau) pour ouvrir l'interface.
-echo    - Vous pouvez aussi glisser une video sur TAPNext_Resolve.bat.
+echo    - Double-cliquez sur "TAPNext_Studio.bat" (ou le raccourci
+echo      "TAPNext Studio" du Bureau) pour ouvrir l'application.
+echo    - Vous pouvez aussi glisser une video sur TAPNext_Studio.bat.
 echo    - Dans DaVinci Resolve (a redemarrer s'il etait ouvert) :
 echo      Workspace ^> Scripts ^> TAPNext_Tracker
 echo  ============================================================

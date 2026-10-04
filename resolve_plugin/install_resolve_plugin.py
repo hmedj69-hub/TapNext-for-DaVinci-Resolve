@@ -48,6 +48,10 @@ def main() -> int:
     root = str(ROOT)
     if "]]" in root:
         raise SystemExit("Chemin d'installation non supporté (contient « ]] ») : " + root)
+    if sys.platform.startswith("win") and not root.isascii():
+        print("ATTENTION : le dossier de l'outil contient des caractères accentués ("
+              + root + "). Resolve ne pourra pas lancer TAPNext Studio depuis ce dossier : "
+              "déplacez-le, par exemple dans C:\\TAPNext, puis relancez l'installateur.")
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(text.replace("@@TAPNEXT_ROOT@@", root), encoding="utf-8")
     print("Script Resolve installé :", dest)

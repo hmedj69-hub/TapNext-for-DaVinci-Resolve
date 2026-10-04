@@ -1,5 +1,5 @@
 @echo off
-REM Lance l'interface graphique. Glissez une video sur ce fichier pour la pre-remplir.
+REM Lance TAPNext Studio. Glissez une video sur ce fichier pour la pre-remplir.
 setlocal
 cd /d "%~dp0"
 set "PYW=%~dp0.venv\Scripts\pythonw.exe"
@@ -9,4 +9,4 @@ echo L'outil n'est pas encore installe : lancez d'abord INSTALLER_Windows.bat
 pause
 exit /b 1
 :run
-start "" "%PYW%" "%~dp0tap_gui.py" %*
+start "" "%PYW%" "%~dp0tap_studio.py" %*

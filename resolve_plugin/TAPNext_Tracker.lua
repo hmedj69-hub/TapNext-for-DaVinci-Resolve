@@ -2,21 +2,17 @@
 TAPNext++ Tracker — intégration DaVinci Resolve
 ================================================
 
-Script Resolve (Lua natif) disponible dans Workspace > Scripts > TAPNext_Tracker
-sur toutes les pages (dossier « Scripts/Utility »).
+Workspace > Scripts > TAPNext_Tracker (toutes les pages).
 
-  1. Placez la tête de lecture sur un clip de la timeline et lancez le script.
-  2. « Ouvrir dans TAPNext Studio » : le clip s'ouvre dans l'application de
-     tracking, limité à la partie utilisée dans la timeline.
-  3. Dans Studio : entourez le sujet, lancez le suivi, réglez la matte en
-     direct, puis « Exporter et envoyer à Resolve ».
-  4. De retour ici, automatiquement :
-       • la matte N&B est attachée au clip (page Color → Add Matte) ;
-       • option : nœud Transform (stabilisation / match-move) ajouté dans la
-         comp Fusion du clip, images-clés calées sur la numérotation de la comp.
-
-Installé par INSTALLER_Windows.bat / install.sh (le chemin du dossier de
-l'outil est inscrit ci-dessous).
+  • Lancé sur un clip : ouvre TAPNext Studio sur ce clip (partie utilisée
+    dans la timeline). Toute l'interface est dans Studio.
+  • Après « Exporter et envoyer à Resolve » dans Studio, les résultats sont
+    importés : matte attachée au clip (page Color → Add Matte), nœud Fusion
+    ajouté dans la comp du clip si demandé.
+      - automatiquement si Resolve fournit la fenêtre d'état (UIManager) ;
+      - sinon en relançant simplement ce script une fois l'export terminé.
+  • Ne dépend pas de UIManager pour fonctionner. Les erreurs s'affichent dans
+    une boîte de dialogue et dans <dossier outil>/jobs/resolve_log.txt.
 ]]
 
 local TAPNEXT_ROOT = [[@@TAPNEXT_ROOT@@]]
@@ -113,26 +109,70 @@ function M.fmt_num(v)
   return (string.format("%.4f", v):gsub("0+$", ""):gsub("%.$", ""))
 end
 
--- ------------------------------------------------------- tâche Studio
+-- ------------------------------------------------------------- journal & messages
+M.LOG_LINES = {}
+
+function M.log(root, msg)
+  print("[TAPNext] " .. msg)
+  M.LOG_LINES[#M.LOG_LINES + 1] = os.date("%H:%M:%S ") .. msg
+  if M.root_is_valid(root) then
+    local f = io.open(M.join(root, "jobs", "resolve_log.txt"), "ab")
+    if f then f:write(os.date("%Y-%m-%d %H:%M:%S ") .. msg .. "\n"); f:close() end
+  end
+end
+
+--[[ Boîte de dialogue native du système (ne dépend pas de UIManager, absent
+     de certaines éditions de Resolve). Le texte passe par un fichier UTF-8
+     pour conserver les accents. ]]
+function M.message(root, text)
+  print("[TAPNext] " .. text)
+  local dir = M.root_is_valid(root) and M.join(root, "jobs") or nil
+  if dir then M.mkdir(dir) end
+  local file = dir and M.join(dir, "message.txt")
+  if not (file and M.write_all(file, text)) then return end
+  if M.IS_WIN then
+    if not M.is_ascii(file) then return end
+    os.execute('powershell -NoProfile -WindowStyle Hidden -Command "Add-Type -AssemblyName ' ..
+      'PresentationFramework; $t = Get-Content -Raw -Encoding UTF8 \'' .. file .. '\'; ' ..
+      '[void][System.Windows.MessageBox]::Show($t, \'TAPNext++\')"')
+  elseif io.popen("uname"):read("*l") == "Darwin" then
+    os.execute("osascript -e 'display dialog (read POSIX file \"" .. file ..
+      "\" as «class utf8») with title \"TAPNext++\" buttons {\"OK\"} default button 1' >/dev/null 2>&1")
+  else
+    os.execute("zenity --info --title=TAPNext++ --text=\"$(cat " .. M.quote(file) .. ")\" >/dev/null 2>&1 &")
+  end
+end
+
+-- ------------------------------------------------------------- tâche Studio
 function M.json_escape(v)
-  return (tostring(v):gsub("\\", "\\\\"):gsub('"', '\\"'))
+  return (tostring(v):gsub("\\", "\\\\"):gsub('"', '\\"'):gsub("\n", "\\n"))
 end
 
 function M.json_field(text, key)
   if not text then return nil end
-  local v = text:match('"' .. key .. '"%s*:%s*"(.-)"')
-  if v then return (v:gsub("\\/", "/"):gsub("\\\\", "\\")) end
-  return text:match('"' .. key .. '"%s*:%s*(%-?%d+)')
+  local k = '"' .. key .. '"%s*:%s*'
+  if text:match(k .. '""') then return "" end
+  local v = text:match(k .. '"(.-[^\\])"')
+  if v then return (v:gsub("\\/", "/"):gsub('\\"', '"'):gsub("\\n", "\n"):gsub("\\\\", "\\")) end
+  return text:match(k .. "(%-?[%d%.]+)") or text:match(k .. "(%a+)")
 end
 
-function M.write_job(job_path, job)
+function M.write_json(path, tbl)
+  local keys = {}
+  for k in pairs(tbl) do keys[#keys + 1] = k end
+  table.sort(keys)
   local parts = {}
-  for _, k in ipairs({ "video", "out_dir", "name", "done" }) do
-    parts[#parts + 1] = string.format('"%s": "%s"', k, M.json_escape(job[k]))
+  for _, k in ipairs(keys) do
+    local v = tbl[k]
+    if type(v) == "number" then
+      parts[#parts + 1] = string.format('"%s": %s', k, M.fmt_num(v))
+    elseif type(v) == "boolean" then
+      parts[#parts + 1] = string.format('"%s": %s', k, tostring(v))
+    else
+      parts[#parts + 1] = string.format('"%s": "%s"', k, M.json_escape(v))
+    end
   end
-  parts[#parts + 1] = string.format('"start": %d', job.start)
-  parts[#parts + 1] = string.format('"end": %d', job["end"])
-  return M.write_all(job_path, "{" .. table.concat(parts, ", ") .. "}")
+  return M.write_all(path, "{" .. table.concat(parts, ", ") .. "}")
 end
 
 function M.studio_cmd(root, job_path)
@@ -144,6 +184,16 @@ function M.studio_cmd(root, job_path)
   end
   return M.quote(M.python_exe(root)) .. " " .. M.quote(M.join(root, "tap_studio.py"))
     .. " --job " .. M.quote(job_path) .. " >/dev/null 2>&1 &"
+end
+
+function M.paths(root)
+  local jobs = M.join(root, "jobs")
+  return {
+    dir = jobs,
+    job = M.join(jobs, "resolve_job.json"),
+    done = M.join(jobs, "resolve_done.json"),
+    ack = M.join(jobs, "resolve_ack.json"),
+  }
 end
 
 -- ------------------------------------------------------------- Resolve
@@ -236,159 +286,214 @@ function M.paste_into_comp(comp, setting_text, insert_before_output)
   return ok and true or false, msg
 end
 
--- ------------------------------------------------------------- interface
-local FUSION = { "none", "stabilize", "matchmove" }
+-- ------------------------------------------------------------- Resolve : accès
+function M.get_resolve()
+  local r = rawget(_G, "resolve")
+  if r then return r end
+  local fn = rawget(_G, "Resolve")
+  if type(fn) == "function" then
+    local ok, v = pcall(fn)
+    if ok and v then return v end
+  end
+  local b = rawget(_G, "bmd")
+  if b and b.scriptapp then
+    local ok, v = pcall(b.scriptapp, "Resolve")
+    if ok and v then return v end
+  end
+  local f = rawget(_G, "fu") or rawget(_G, "fusion")
+  if f then
+    local ok, v = pcall(function() return f:GetResolve() end)
+    if ok and v then return v end
+  end
+  return nil
+end
 
-function M.run_ui(resolve, fu)
-  local ctx, err = M.get_context(resolve)
-  local ui = fu.UIManager
-  local disp = bmd.UIDispatcher(ui)
+--[[ Retrouve le clip de la timeline correspondant à une tâche (identifiant
+     unique, sinon même média sous la tête de lecture). ]]
+function M.find_item(resolve, job_text)
+  local proj = resolve:GetProjectManager():GetCurrentProject()
+  local tl = proj and proj:GetCurrentTimeline()
+  if not tl then return nil end
+  local uid = M.json_field(job_text, "item_uid")
+  if uid and uid ~= "" then
+    for t = 1, (tonumber(tl:GetTrackCount("video")) or 0) do
+      for _, it in ipairs(tl:GetItemListInTrack("video", t) or {}) do
+        local ok, id = pcall(function() return it:GetUniqueId() end)
+        if ok and id == uid then return it end
+      end
+    end
+  end
+  local cur = tl:GetCurrentVideoItem()
+  local mpi = cur and cur:GetMediaPoolItem()
+  if mpi and mpi:GetClipProperty("File Path") == M.json_field(job_text, "video") then
+    return cur
+  end
+  return nil
+end
 
-  if not ctx then
-    local w = disp:AddWindow({ ID = "TAPErr", WindowTitle = "TAPNext++", Geometry = { 300, 300, 420, 140 } },
-      ui:VGroup { ui:Label { Text = err, WordWrap = true }, ui:Button { ID = "Ok", Text = "OK" } })
-    function w.On.Ok.Clicked() disp:ExitLoop() end
-    function w.On.TAPErr.Close() disp:ExitLoop() end
-    w:Show(); disp:RunLoop(); w:Hide()
+--[[ Importe les résultats d'un export Studio. Renvoie la liste des lignes du
+     rapport (aussi écrite dans resolve_ack.json, que Studio affiche). ]]
+function M.import_results(resolve, root, job_text, done_text)
+  local P = M.paths(root)
+  local report = {}
+  local item = M.find_item(resolve, job_text)
+  if not item then
+    report[#report + 1] = "Clip introuvable dans la timeline active : placez la tête de lecture " ..
+      "sur le clip traité puis relancez Workspace > Scripts > TAPNext_Tracker."
+    return report, false
+  end
+  local ctx = {
+    item = item, mpi = item:GetMediaPoolItem(),
+    in_frame = tonumber(M.json_field(job_text, "start")) or 0,
+  }
+  local matte = M.json_field(done_text, "matte")
+  if matte and matte ~= "" and M.json_field(done_text, "attach") ~= "false" then
+    if M.attach_matte(resolve, ctx, matte) then
+      report[#report + 1] = "✔ Matte attachée au clip : page Color → clic droit → Add Matte."
+    else
+      report[#report + 1] = "✘ Matte non attachée automatiquement ; importez-la : " .. matte
+    end
+  end
+  local mode = M.json_field(done_text, "fusion_mode") or "none"
+  local csv = M.json_field(done_text, "csv")
+  if mode ~= "none" and csv then
+    local comp, offset = M.get_comp(ctx)
+    if comp then
+      local setting = M.join(P.dir, "resolve_fusion_" .. mode .. ".setting")
+      local smooth = tonumber(M.json_field(done_text, "fusion_smooth")) or 0
+      local text = M.make_setting(root, csv, mode, smooth, offset, setting)
+      if text then
+        local ok, msg = M.paste_into_comp(comp, text, mode == "stabilize")
+        report[#report + 1] = ok and ("✔ " .. msg) or "✘ Collage du nœud Fusion impossible."
+      else
+        report[#report + 1] = "✘ Génération du nœud Fusion impossible."
+      end
+    else
+      report[#report + 1] = "✘ Comp Fusion introuvable pour ce clip."
+    end
+  end
+  return report, true
+end
+
+function M.finish_import(resolve, root, job_text, done_text)
+  local P = M.paths(root)
+  local report, ok = M.import_results(resolve, root, job_text, done_text)
+  M.write_json(P.ack, { status = ok and "ok" or "error", report = table.concat(report, "\n"),
+    job_id = M.json_field(job_text, "job_id") or "" })
+  os.rename(P.done, P.done .. ".imported")
+  for _, l in ipairs(report) do M.log(root, l) end
+  return report, ok
+end
+
+-- ------------------------------------------------------------- point d'entrée
+function M.main()
+  local root = TAPNEXT_ROOT
+  if not M.root_is_valid(root) then
+    M.message(nil, "TAPNext++ : dossier de l'outil introuvable (" .. tostring(root) .. ").\n" ..
+      "Relancez INSTALLER_Windows.bat depuis le dossier TAPNext.")
+    return
+  end
+  local P = M.paths(root)
+  M.mkdir(P.dir)
+  M.log(root, "Lancement du script (" .. _VERSION .. ")")
+  if M.IS_WIN and not M.is_ascii(root) then
+    M.message(root, "Le dossier de l'outil contient des caractères accentués :\n" .. root ..
+      "\n\nDéplacez-le (ex. C:\\TAPNext) puis relancez INSTALLER_Windows.bat.")
+    return
+  end
+  if not M.exists(M.python_exe(root)) then
+    M.message(root, "Installation incomplète : lancez INSTALLER_Windows.bat dans\n" .. root)
+    return
+  end
+  local resolve = M.get_resolve()
+  if not resolve then
+    M.message(root, "Impossible d'accéder à DaVinci Resolve depuis le script.\n" ..
+      "Lancez-le depuis Workspace > Scripts dans Resolve.")
     return
   end
 
-  local root = TAPNEXT_ROOT
-  local win = disp:AddWindow({
-    ID = "TAPWin", WindowTitle = "TAPNext++ Tracker", Geometry = { 240, 160, 520, 380 },
-  }, ui:VGroup {
-    ui:Label { Weight = 0, WordWrap = true, Text = "<b>Clip :</b> " .. ctx.name ..
-      "<br><small>" .. ctx.path .. "</small><br><small>Images source " .. ctx.in_frame ..
-      " → " .. ctx.out_frame .. " (partie utilisée dans la timeline)</small>" },
-    ui:HGroup { Weight = 0,
-      ui:Label { Text = "Dossier de l'outil", MinimumSize = { 120, 20 } },
-      ui:LineEdit { ID = "Root", Text = M.root_is_valid(root) and root or "" } },
-    ui:CheckBox { ID = "Attach", Weight = 0, Checked = true,
-      Text = "Attacher la matte au clip (page Color → Add Matte)" },
-    ui:HGroup { Weight = 0,
-      ui:Label { Text = "Nœud Fusion", MinimumSize = { 120, 20 } }, ui:ComboBox { ID = "Fusion" } },
-    ui:HGroup { Weight = 0,
-      ui:Label { Text = "Lissage stabilisation", MinimumSize = { 120, 20 } },
-      ui:SpinBox { ID = "Smooth", Minimum = 0, Maximum = 200, Value = 0 } },
-    ui:Button { ID = "Open", Weight = 0, Text = "Ouvrir dans TAPNext Studio" },
-    ui:Label { ID = "Status", Weight = 1, WordWrap = true, Alignment = { AlignTop = true },
-      Text = "Studio s'ouvre sur ce clip : entourez le sujet, lancez le suivi, puis " ..
-        "« Exporter et envoyer à Resolve ». Les résultats arriveront ici automatiquement." },
-    ui:HGroup { Weight = 0, ui:HGap(0, 1), ui:Button { ID = "Close", Text = "Fermer" } },
+  -- 1) Un export Studio attend d'être importé ? → on l'importe.
+  local done_text = M.read_all(P.done)
+  local job_text = M.read_all(P.job)
+  if done_text and job_text and M.json_field(done_text, "status") == "ok" then
+    local report, ok = M.finish_import(resolve, root, job_text, done_text)
+    M.message(root, "TAPNext++ — import dans Resolve\n\n" .. table.concat(report, "\n"))
+    if ok then return end
+  end
+
+  -- 2) Sinon : ouvrir TAPNext Studio sur le clip sous la tête de lecture.
+  local ctx, err = M.get_context(resolve)
+  if not ctx then
+    M.message(root, "TAPNext++ : " .. err)
+    return
+  end
+  local out_dir = M.join(M.dirname(ctx.path), "TAPNext")
+  if (M.IS_WIN and not M.is_ascii(out_dir)) or not M.dir_writable(out_dir) then
+    out_dir = M.join(root, "output")
+    M.mkdir(out_dir)
+  end
+  local base = M.basename_noext(ctx.path)
+  if M.IS_WIN and not M.is_ascii(base) then base = "clip" end
+  local name = base .. "_" .. ctx.in_frame .. "-" .. ctx.out_frame
+  local okid, uid = pcall(function() return ctx.item:GetUniqueId() end)
+  local job_id = tostring(os.time())
+  os.remove(P.done)
+  os.remove(P.ack)
+  M.write_json(P.job, {
+    video = ctx.path, out_dir = out_dir, name = name, done = P.done, ack = P.ack,
+    start = ctx.in_frame, ["end"] = ctx.out_frame, item_uid = okid and uid or "",
+    clip_name = ctx.name, job_id = job_id,
   })
+  M.log(root, "Ouverture de TAPNext Studio : " .. ctx.path .. " [" .. ctx.in_frame .. "-" .. ctx.out_frame .. "]")
+  os.execute(M.studio_cmd(root, P.job))
+
+  -- 3) Attente de l'export (si la fenêtre d'état est disponible) ; sinon
+  --    l'utilisateur relance le script après l'export pour importer.
+  local fusion = rawget(_G, "fu") or rawget(_G, "fusion")
+  local ui = fusion and fusion.UIManager
+  local b = rawget(_G, "bmd")
+  if not (ui and b and b.UIDispatcher) then
+    M.log(root, "UIManager indisponible : import au prochain lancement du script.")
+    return
+  end
+  local disp = b.UIDispatcher(ui)
+  local win = disp:AddWindow({ ID = "TAPWin", WindowTitle = "TAPNext++", Geometry = { 260, 200, 460, 170 } },
+    ui:VGroup {
+      ui:Label { ID = "Status", WordWrap = true, Weight = 1,
+        Text = "TAPNext Studio est ouvert sur « " .. ctx.name .. " ».\n" ..
+          "Les résultats seront importés ici automatiquement après l'export." },
+      ui:HGroup { Weight = 0, ui:HGap(0, 1), ui:Button { ID = "Close", Text = "Fermer" } },
+    })
   local itm = win:GetItems()
-  for _, m in ipairs({ "Aucun", "Stabiliser (inséré dans la comp)", "Match-move (nœud ajouté)" }) do
-    itm.Fusion:AddItem(m)
-  end
-
-  local state = { waiting = false }
   local timer = ui:Timer { ID = "Poll", Interval = 1000 }
-  local function set_status(s) itm.Status.Text = s end
-
-  local function import_results(done_text)
-    local opts = state.opts
-    local report = { "Résultats reçus de TAPNext Studio." }
-    local matte = M.json_field(done_text, "matte")
-    if itm.Attach.Checked and matte and matte ~= "" then
-      if M.attach_matte(resolve, ctx, matte) then
-        report[#report + 1] = "✔ Matte attachée au clip : page Color → clic droit → Add Matte."
-      else
-        report[#report + 1] = "Matte non attachée automatiquement ; importez : " .. matte
-      end
-    end
-    local mode = FUSION[itm.Fusion.CurrentIndex + 1] or "none"
-    local csv = M.json_field(done_text, "csv")
-    if mode ~= "none" and csv then
-      local comp, offset = M.get_comp(ctx)
-      if comp then
-        local setting = M.join(opts.out_dir, opts.name .. "_fusion_" .. mode .. ".setting")
-        local text = M.make_setting(opts.root, csv, mode, itm.Smooth.Value, offset, setting)
-        if text then
-          local ok, msg = M.paste_into_comp(comp, text, mode == "stabilize")
-          report[#report + 1] = ok and ("✔ " .. msg) or ("Collage Fusion impossible ; fichier : " .. setting)
-        else
-          report[#report + 1] = "Génération du nœud Fusion impossible."
-        end
-      else
-        report[#report + 1] = "Comp Fusion introuvable pour ce clip."
-      end
-    end
-    report[#report + 1] = "Fichiers : " .. opts.out_dir
-    set_status(table.concat(report, "\n"))
-  end
-
   function disp.On.Poll.Timeout()
-    if not state.waiting then timer:Stop() return end
-    local text = M.read_all(state.done)
-    if not text or text == "" then return end
+    local d = M.read_all(P.done)
+    if not d or d == "" then return end
     timer:Stop()
-    state.waiting = false
-    itm.Open.Enabled = true
-    if M.json_field(text, "status") == "ok" then
-      import_results(text)
+    if M.json_field(d, "status") == "ok" then
+      local report = M.finish_import(resolve, root, M.read_all(P.job), d)
+      itm.Status.Text = table.concat(report, "\n")
     else
-      set_status("TAPNext Studio a été fermé sans export.")
+      itm.Status.Text = "TAPNext Studio a été fermé sans export."
+      os.remove(P.done)
     end
   end
-
-  function win.On.Open.Clicked()
-    local r = itm.Root.Text
-    if not M.root_is_valid(r) then
-      set_status("Dossier de l'outil invalide : indiquez le dossier qui contient tap_studio.py.")
-      return
-    end
-    if not M.exists(M.python_exe(r)) then
-      set_status("Environnement Python absent : lancez d'abord l'installateur dans " .. r)
-      return
-    end
-    if M.IS_WIN and not M.is_ascii(r) then
-      set_status("Le dossier de l'outil contient des caractères accentués : déplacez-le " ..
-        "(ex. C:\\TAPNext) puis relancez l'installateur.")
-      return
-    end
-    local out_dir = M.join(M.dirname(ctx.path), "TAPNext")
-    if (M.IS_WIN and not M.is_ascii(out_dir)) or not M.dir_writable(out_dir) then
-      out_dir = M.join(r, "output")
-      M.mkdir(out_dir)
-    end
-    local base = M.basename_noext(ctx.path)
-    if M.IS_WIN and not M.is_ascii(base) then base = "clip" end
-    local name = base .. "_" .. ctx.in_frame .. "-" .. ctx.out_frame
-    local opts = { root = r, out_dir = out_dir, name = name }
-    local jobs = M.join(r, "jobs")
-    M.mkdir(jobs)
-    local job = M.join(jobs, "resolve_job.json")
-    local done = M.join(jobs, "resolve_done.json")
-    os.remove(done)
-    M.write_job(job, { video = ctx.path, out_dir = out_dir, name = name, done = done,
-      start = ctx.in_frame, ["end"] = ctx.out_frame })
-    os.execute(M.studio_cmd(r, job))
-    state.waiting, state.done, state.opts = true, done, opts
-    itm.Open.Enabled = false
-    set_status("TAPNext Studio est ouvert. En attente de l'export…\n(Gardez cette fenêtre ouverte.)")
-    timer:Start()
-  end
-
-  local function close()
-    timer:Stop()
-    disp:ExitLoop()
-  end
+  local function close() timer:Stop(); disp:ExitLoop() end
   win.On.Close.Clicked = close
   win.On.TAPWin.Close = close
-
   win:Show()
+  timer:Start()
   disp:RunLoop()
   win:Hide()
 end
 
--- ------------------------------------------------------------- point d'entrée
 if not TAPNEXT_TEST then
-  local res = resolve or (Resolve and Resolve())
-  local fusion_obj = fu or fusion or (res and res:Fusion())
-  if not res or not fusion_obj then
-    print("TAPNext++ : ce script doit être lancé depuis DaVinci Resolve (Workspace > Scripts).")
-  else
-    M.run_ui(res, fusion_obj)
+  local ok, err = pcall(M.main)
+  if not ok then
+    local root = TAPNEXT_ROOT
+    M.log(root, "ERREUR : " .. tostring(err))
+    M.message(root, "TAPNext++ : erreur inattendue\n\n" .. tostring(err) ..
+      "\n\nJournal : " .. M.join(tostring(root), "jobs", "resolve_log.txt"))
   end
 end
 

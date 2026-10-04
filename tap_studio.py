@@ -247,6 +247,7 @@ class ExportThread(QThread):
                     p = f"{base}_fusion_{mode}.setting"
                     fx.export_setting(csv_path, p, info.width, info.height, mode=mode,
                                       min_visibility=0.5, ref_frame=j["ref_frame"],
+                                      smooth_radius=j["fusion_smooth"],
                                       outlier_px=max(2.0, 0.002 * info.width))
                     outputs.append(p)
             if j["matte"]:
@@ -894,9 +895,16 @@ class StudioWindow(QMainWindow):
         self.fusion_mode.setCurrentIndex(0 if self.job else 3)
         row.addWidget(self.fusion_mode, 1)
         gl.addLayout(row)
+        self.fusion_smooth = ValueSlider("Lissage de la stabilisation (0 = plan verrouillé)",
+                                         0, 100, 0, 1, "{:.0f}")
+        gl.addWidget(self.fusion_smooth)
+        self.cb_attach = QCheckBox("Attacher la matte au clip dans Resolve")
+        self.cb_attach.setChecked(True)
+        self.cb_attach.setVisible(bool(self.job))
+        gl.addWidget(self.cb_attach)
         if self.job:
-            gl.addWidget(help_label("Le nœud Fusion se règle dans la fenêtre de Resolve "
-                                    "(il y est inséré automatiquement)."))
+            gl.addWidget(help_label("Le nœud Fusion choisi est inséré directement dans la comp "
+                                    "du clip, dans Resolve."))
         self.cb_preview = QCheckBox("Vidéo de contrôle (preview)")
         gl.addWidget(self.cb_preview)
         self.b_export = QPushButton("⇪  Exporter et envoyer à Resolve" if self.job else "⇪  Exporter")
@@ -1349,7 +1357,10 @@ class StudioWindow(QMainWindow):
             matte=self.cb_matte.isChecked() or bool(self.job),
             codec=["prores", "dnxhr", "h264", "png"][self.codec.currentIndex()],
             data=self.cb_data.isChecked(),
-            fusion=["none", "stabilize", "matchmove", "both"][self.fusion_mode.currentIndex()],
+            fusion="none" if self.job else
+            ["none", "stabilize", "matchmove", "both"][self.fusion_mode.currentIndex()],
+            fusion_to_resolve=["none", "stabilize", "matchmove", "both"][self.fusion_mode.currentIndex()],
+            fusion_smooth=int(self.fusion_smooth.value()),
             preview=self.cb_preview.isChecked(), mparams=self.matte_params(),
             ref_frame=ref, job_mode=bool(self.job),
             params=dict(start_frame=ref, segment=[self.seg_in, self.seg_out],
@@ -1381,19 +1392,51 @@ class StudioWindow(QMainWindow):
         self.lbl_prog.setText("Export terminé.")
         if self.job:
             base = os.path.join(job["out_dir"], job["name"])
+            mode = job["fusion_to_resolve"]
             done = dict(status="ok", matte=next((o for o in outputs if "_matte" in o), ""),
                         csv=base + "_tracks.csv", outputs=outputs,
-                        query_frame=job["ref_frame"])
+                        query_frame=job["ref_frame"], job_id=str(self.job.get("job_id", "")),
+                        fusion_mode="stabilize" if mode == "both" else mode,
+                        fusion_smooth=job["fusion_smooth"], attach=self.cb_attach.isChecked())
             with open(self.job["done"], "w", encoding="utf-8") as f:
                 json.dump(done, f, ensure_ascii=False, indent=1)
             self.job_sent = True
-            QMessageBox.information(
-                self, APP_NAME, "Résultats envoyés à DaVinci Resolve.\n\n"
-                "La matte est attachée au clip (page Color → clic droit → Add Matte).\n"
-                "Vous pouvez fermer TAPNext Studio.")
+            self.lbl_prog.setText("Export terminé — en attente de DaVinci Resolve…")
+            self._ack_deadline = time.time() + 20
+            self._ack_timer = QTimer(self)
+            self._ack_timer.timeout.connect(self._poll_ack)
+            self._ack_timer.start(500)
         else:
             QMessageBox.information(self, APP_NAME, "Export terminé :\n\n" + "\n".join(
                 os.path.basename(o) for o in outputs) + f"\n\nDossier : {job['out_dir']}")
+
+    def _poll_ack(self):
+        """Attend la confirmation d'import écrite par le script Resolve."""
+        path = self.job.get("ack", "")
+        ack = None
+        if path and os.path.isfile(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    ack = json.load(f)
+            except (OSError, ValueError):
+                ack = None
+        if ack is not None and str(ack.get("job_id", "")) in ("", str(self.job.get("job_id", ""))):
+            self._ack_timer.stop()
+            ok = ack.get("status") == "ok"
+            self.lbl_prog.setText("Importé dans DaVinci Resolve." if ok else "Import incomplet.")
+            (QMessageBox.information if ok else QMessageBox.warning)(
+                self, APP_NAME, "DaVinci Resolve :\n\n" + ack.get("report", "")
+                + ("\n\nVous pouvez fermer TAPNext Studio." if ok else ""))
+            return
+        if time.time() > self._ack_deadline:
+            self._ack_timer.stop()
+            self.lbl_prog.setText("Export terminé. Import : relancez le script dans Resolve.")
+            QMessageBox.information(
+                self, APP_NAME,
+                "Export terminé.\n\nPour importer dans DaVinci Resolve :\n"
+                "retournez dans Resolve et relancez\n"
+                "Workspace → Scripts → TAPNext_Tracker.\n\n"
+                "La matte sera attachée au clip et le nœud Fusion ajouté.")
 
     def closeEvent(self, e):
         for t in (self.tracker_thread, self.export_thread):

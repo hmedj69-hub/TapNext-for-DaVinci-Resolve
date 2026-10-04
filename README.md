@@ -32,14 +32,21 @@ INSTALLER_Windows.bat, install.sh, TAPNext_Studio.bat/.sh, TAPNext_CLI.bat
 ## 🎬 Utilisation depuis DaVinci Resolve
 
 1. Placez la tête de lecture sur le clip à traiter, dans la page Edit ou Color.
-2. **Workspace → Scripts → TAPNext_Tracker**. Une petite fenêtre s'ouvre. Choisissez si la matte doit être attachée au clip et si un nœud Fusion doit être ajouté (Stabiliser ou Match-move).
-3. **Ouvrir dans TAPNext Studio** : le clip s'ouvre dans Studio. La plage de suivi est limitée à la partie utilisée dans la timeline.
-4. Dans Studio, travaillez comme décrit ci-dessous, puis cliquez sur **Exporter et envoyer à Resolve**.
-5. De retour dans Resolve, automatiquement :
+2. **Workspace → Scripts → TAPNext_Tracker** : **TAPNext Studio s'ouvre directement sur ce clip**. La plage de suivi est limitée à la partie utilisée dans la timeline.
+3. Dans Studio : entourez le sujet, lancez le suivi, réglez la matte. Dans ⑤, choisissez le nœud Fusion (Stabilisation ou Match-move) et l'option « Attacher la matte au clip », puis cliquez sur **Exporter et envoyer à Resolve**.
+4. Les résultats arrivent dans Resolve :
+   - **automatiquement**, si votre Resolve affiche la petite fenêtre « TAPNext++ » à l'ouverture de Studio ;
+   - sinon, il suffit de **relancer Workspace → Scripts → TAPNext_Tracker** une fois l'export terminé (Studio vous le rappelle). C'est le cas notamment sur la version gratuite de Resolve, où les scripts ne peuvent pas ouvrir de fenêtre.
+   Une boîte de dialogue confirme ce qui a été importé :
    - la **matte** est attachée au clip. Dans la page **Color** : clic droit dans l'éditeur de nœuds → **Add Matte**, puis reliez la sortie bleue (Key) à l'entrée Key du nœud de correction. Ce câblage reste manuel, car l'API de Resolve ne permet pas de connecter les nœuds de la page Color ;
-   - le **nœud Fusion** est ajouté dans la comp du clip, avec des images-clés calées sur la numérotation de la comp. En mode Stabiliser, il est directement inséré avant `MediaOut1`.
+   - le **nœud Fusion** est ajouté dans la comp du clip, avec des images-clés calées sur la numérotation de la comp. En mode Stabilisation, il est directement inséré avant `MediaOut1`.
 
-Gardez la fenêtre du script ouverte pendant que vous travaillez dans Studio : c'est elle qui récupère les résultats.
+**Il ne se passe rien ?**
+- Toute erreur s'affiche maintenant dans une boîte de dialogue. Le détail est dans `jobs\resolve_log.txt`, dans le dossier de l'outil, et dans **Workspace → Console**.
+- Si le dossier de l'outil a été déplacé, ou si vous avez mis à jour les fichiers, relancez `INSTALLER_Windows.bat`. Il réinstalle le script dans Resolve avec le bon chemin.
+- Le dossier de l'outil ne doit pas contenir d'accents (par exemple `C:\TAPNext`).
+
+> Pourquoi pas un « vrai » plugin, effet OFX ou panneau intégré ? Un effet OFX calcule chaque image séparément, et souvent dans le désordre. TAPNext++ doit au contraire lire tout le plan dans l'ordre, sur le GPU, avec PyTorch, ce qu'un effet ne peut pas faire. Les panneaux intégrés (*Workflow Integration Plugins*) sont réservés à DaVinci Resolve Studio. Le script + Studio fonctionne avec toutes les éditions.
 
 ---
 

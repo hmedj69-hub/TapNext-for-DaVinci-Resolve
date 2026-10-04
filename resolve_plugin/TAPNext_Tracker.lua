@@ -349,7 +349,9 @@ function M.import_results(resolve, root, job_text, done_text)
   local matte = M.json_field(done_text, "matte")
   if matte and matte ~= "" and M.json_field(done_text, "attach") ~= "false" then
     if M.attach_matte(resolve, ctx, matte) then
-      report[#report + 1] = "✔ Matte attachée au clip : page Color → clic droit → Add Matte."
+      report[#report + 1] = "✔ Matte attachée au clip (Media Pool).\n" ..
+        "→ Page Color : clic droit dans la zone des nœuds → Add Matte → choisissez " ..
+        "la matte, puis reliez sa sortie bleue (Key) à l'entrée Key du nœud à corriger."
     else
       report[#report + 1] = "✘ Matte non attachée automatiquement ; importez-la : " .. matte
     end
@@ -359,15 +361,25 @@ function M.import_results(resolve, root, job_text, done_text)
   if mode ~= "none" and csv then
     local comp, offset = M.get_comp(ctx)
     if comp then
-      local setting = M.join(P.dir, "resolve_fusion_" .. mode .. ".setting")
+      local modes = (mode == "both") and { "stabilize", "matchmove" } or { mode }
       local smooth = tonumber(M.json_field(done_text, "fusion_smooth")) or 0
-      local text = M.make_setting(root, csv, mode, smooth, offset, setting)
-      if text then
-        local ok, msg = M.paste_into_comp(comp, text, mode == "stabilize")
-        report[#report + 1] = ok and ("✔ " .. msg) or "✘ Collage du nœud Fusion impossible."
-      else
-        report[#report + 1] = "✘ Génération du nœud Fusion impossible."
+      for _, md in ipairs(modes) do
+        local setting = M.join(P.dir, "resolve_fusion_" .. md .. ".setting")
+        local text = M.make_setting(root, csv, md, smooth, offset, setting)
+        if text then
+          -- Stabilisation seule : branchée avant MediaOut. « Les deux » : nœuds
+          -- ajoutés sans branchement, l'image du clip n'est pas modifiée.
+          local ok, msg = M.paste_into_comp(comp, text, mode == "stabilize")
+          if ok and mode == "both" then
+            msg = "Nœud " .. (md == "stabilize" and "TAP_Stabilize" or "TAP_MatchMove") ..
+              " ajouté dans la comp Fusion (à brancher)."
+          end
+          report[#report + 1] = ok and ("✔ " .. msg) or "✘ Collage du nœud Fusion impossible."
+        else
+          report[#report + 1] = "✘ Génération du nœud Fusion impossible (" .. md .. ")."
+        end
       end
+      report[#report + 1] = "→ Page Fusion : la comp du clip contient les nœuds TAP_…"
     else
       report[#report + 1] = "✘ Comp Fusion introuvable pour ce clip."
     end
@@ -457,19 +469,29 @@ function M.main()
     return
   end
   local disp = b.UIDispatcher(ui)
-  local win = disp:AddWindow({ ID = "TAPWin", WindowTitle = "TAPNext++", Geometry = { 260, 200, 460, 170 } },
+  local win = disp:AddWindow({ ID = "TAPWin", WindowTitle = "TAPNext++", Geometry = { 260, 200, 480, 200 } },
     ui:VGroup {
       ui:Label { ID = "Status", WordWrap = true, Weight = 1,
         Text = "TAPNext Studio est ouvert sur « " .. ctx.name .. " ».\n" ..
           "Les résultats seront importés ici automatiquement après l'export." },
-      ui:HGroup { Weight = 0, ui:HGap(0, 1), ui:Button { ID = "Close", Text = "Fermer" } },
+      ui:HGroup { Weight = 0,
+        ui:Button { ID = "Import", Text = "Importer maintenant" },
+        ui:HGap(0, 1),
+        ui:Button { ID = "Close", Text = "Fermer" } },
     })
   local itm = win:GetItems()
-  local timer = ui:Timer { ID = "Poll", Interval = 1000 }
-  function disp.On.Poll.Timeout()
+  local state = { done = false }
+
+  -- Vérifie l'export ; renvoie true quand c'est terminé (importé ou annulé).
+  local function check(manual)
+    if state.done then return true end
     local d = M.read_all(P.done)
-    if not d or d == "" then return end
-    timer:Stop()
+    if not d or d == "" then
+      if manual then itm.Status.Text = "Pas encore d'export : terminez dans TAPNext Studio " ..
+        "(« Exporter et envoyer à Resolve »)." end
+      return false
+    end
+    state.done = true
     if M.json_field(d, "status") == "ok" then
       local report = M.finish_import(resolve, root, M.read_all(P.job), d)
       itm.Status.Text = table.concat(report, "\n")
@@ -477,12 +499,41 @@ function M.main()
       itm.Status.Text = "TAPNext Studio a été fermé sans export."
       os.remove(P.done)
     end
+    return true
   end
-  local function close() timer:Stop(); disp:ExitLoop() end
+  local function safe_check(manual)
+    local ok, res = pcall(check, manual)
+    if not ok then
+      state.done = true
+      M.log(root, "ERREUR import : " .. tostring(res))
+      itm.Status.Text = "Erreur pendant l'import : " .. tostring(res)
+      return true
+    end
+    return res
+  end
+
+  -- Minuteur : l'événement Timeout est reçu par le dispatcher (disp.On.Timeout).
+  local timer
+  local ok_timer = pcall(function()
+    timer = ui:Timer { ID = "TAPPoll", Interval = 1000, SingleShot = false }
+    disp.On.Timeout = function()
+      if safe_check(false) and timer then timer:Stop() end
+    end
+    timer:Start()
+  end)
+  if not ok_timer then
+    timer = nil
+    itm.Status.Text = itm.Status.Text .. "\n(Après l'export, cliquez sur « Importer maintenant ».)"
+  end
+
+  win.On.Import.Clicked = function() safe_check(true) end
+  local function close()
+    if timer then pcall(function() timer:Stop() end) end
+    disp:ExitLoop()
+  end
   win.On.Close.Clicked = close
   win.On.TAPWin.Close = close
   win:Show()
-  timer:Start()
   disp:RunLoop()
   win:Hide()
 end

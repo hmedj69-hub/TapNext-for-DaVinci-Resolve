@@ -1204,7 +1204,7 @@ class StudioWindow(QMainWindow):
         row.addWidget(QLabel("Fusion"))
         self.fusion_mode = QComboBox()
         self.fusion_mode.addItems(["Aucun nœud", "Stabilisation", "Match-move", "Les deux"])
-        self.fusion_mode.setCurrentIndex(0 if self.job else 3)
+        self.fusion_mode.setCurrentIndex(3)
         row.addWidget(self.fusion_mode, 1)
         gl.addLayout(row)
         self.fusion_smooth = ValueSlider("Lissage de la stabilisation (0 = plan verrouillé)",
@@ -1215,8 +1215,9 @@ class StudioWindow(QMainWindow):
         self.cb_attach.setVisible(bool(self.job))
         gl.addWidget(self.cb_attach)
         if self.job:
-            gl.addWidget(help_label("Le nœud Fusion choisi est inséré directement dans la comp "
-                                    "du clip, dans Resolve."))
+            gl.addWidget(help_label(
+                "Fusion : « Stabilisation » insère le nœud dans la chaîne du clip (l'image est "
+                "stabilisée). « Match-move » et « Les deux » ajoutent les nœuds sans les brancher."))
         self.cb_preview = QCheckBox("Vidéo de contrôle (preview)")
         self.cb_preview.setChecked(True)
         gl.addWidget(self.cb_preview)
@@ -1987,7 +1988,7 @@ class StudioWindow(QMainWindow):
                                                  or "_matte_png" in o), ""),
                         csv=base + "_tracks.csv", outputs=outputs,
                         query_frame=job["ref_frame"], job_id=str(self.job.get("job_id", "")),
-                        fusion_mode="stabilize" if mode == "both" else mode,
+                        fusion_mode=mode,
                         fusion_smooth=job["fusion_smooth"], attach=self.cb_attach.isChecked())
             with open(self.job["done"], "w", encoding="utf-8") as f:
                 json.dump(done, f, ensure_ascii=False, indent=1)

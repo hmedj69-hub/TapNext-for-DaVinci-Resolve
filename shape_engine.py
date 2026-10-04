@@ -364,6 +364,55 @@ class ShapeRenderer:
 
 
 # =============================================================================
+# Fichier de suivi pour l'effet OFX « TAPNext Shapes » (.tapfx)
+# =============================================================================
+
+def export_tapfx(path: str, res: "eng.TrackResult", point_groups: np.ndarray,
+                 width: int, height: int, fps: float) -> str:
+    """Écrit le fichier binaire lu par le plugin OFX (voir TAPNextShapes.cpp).
+
+    point_groups : [Q] numéro de groupe (0, 1, 2… dans l'ordre de Studio).
+    """
+    T, Q = res.visibility.shape
+    valid = valid_mask(res, np.arange(Q))
+    with open(path, "wb") as f:
+        f.write(b"TAPFX01\0")
+        np.array([width, height, T, Q, 0, 0, 0, 0], "<i4").tofile(f)
+        np.array([fps], "<f4").tofile(f)
+        np.ascontiguousarray(res.positions, "<f4").tofile(f)
+        np.ascontiguousarray(res.visibility, "<f4").tofile(f)
+        np.ascontiguousarray(valid, np.uint8).tofile(f)
+        np.ascontiguousarray(point_groups, "<i4").tofile(f)
+    remember_last_tapfx(path)
+    return path
+
+
+def last_tapfx_file() -> str:
+    """Fichier où l'on note le dernier export (lu par l'effet OFX quand son
+    champ « Fichier de suivi » est vide)."""
+    import os
+    import sys
+    if sys.platform.startswith("win"):
+        base = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "TAPNext")
+    elif sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support/TAPNext")
+    else:
+        base = os.path.expanduser("~/.config/TAPNext")
+    return os.path.join(base, "last_tapfx.txt")
+
+
+def remember_last_tapfx(path: str) -> None:
+    import os
+    try:
+        f = last_tapfx_file()
+        os.makedirs(os.path.dirname(f), exist_ok=True)
+        with open(f, "w", encoding="utf-8") as fh:
+            fh.write(os.path.abspath(path))
+    except OSError:
+        pass
+
+
+# =============================================================================
 # Export vidéo
 # =============================================================================
 

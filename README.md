@@ -5,6 +5,7 @@ Tracking de points avec **TAPNext++** de Google DeepMind ([`google-deepmind/tapn
 ```
 tap_studio.py         ← TAPNext Studio : application visuelle (recommandé)
 shape_engine.py       ← rendu des groupes de formes (mattes)
+ofx_plugin/           ← effet OFX « TAPNext Shapes » pour Resolve (C++, binaire Windows fourni)
 tap_resolve_tool.py   ← moteur (tracking, mattes, exports) + ligne de commande
 fusion_export.py      ← CSV → nœuds Fusion (sans dépendance ; fonctionne aussi DANS Resolve)
 resolve_plugin/       ← script Resolve « Workspace → Scripts → TAPNext_Tracker »
@@ -48,6 +49,38 @@ INSTALLER_Windows.bat, install.sh, TAPNext_Studio.bat/.sh, TAPNext_CLI.bat
 - Le dossier de l'outil ne doit pas contenir d'accents (par exemple `C:\TAPNext`).
 
 > Pourquoi pas un « vrai » plugin, effet OFX ou panneau intégré ? Un effet OFX calcule chaque image séparément, et souvent dans le désordre. TAPNext++ doit au contraire lire tout le plan dans l'ordre, sur le GPU, avec PyTorch, ce qu'un effet ne peut pas faire. Les panneaux intégrés (*Workflow Integration Plugins*) sont réservés à DaVinci Resolve Studio. Le script + Studio fonctionne avec toutes les éditions.
+
+---
+
+## ✨ Effet OFX « TAPNext Shapes » (dans Resolve)
+
+L'installateur ajoute un **vrai effet OpenFX** dans DaVinci Resolve. Toutes les formes se règlent **dans l'Inspecteur de Resolve**, en direct, et l'alpha sort directement sur le nœud de la page Color.
+
+1. Faites le suivi dans **TAPNext Studio**, par exemple depuis **Workspace → Scripts → TAPNext_Tracker**, puis **Exportez**. Studio écrit un fichier de suivi `.tapfx` et le mémorise comme « dernier export ».
+2. Dans Resolve, page **Color** : ouvrez la bibliothèque **Effets → OpenFX → TAPNext → TAPNext Shapes** et glissez l'effet sur un nœud (ou sur le clip dans la page Edit).
+3. Le champ **Fichier de suivi** se remplit tout seul avec le dernier export. Réglez ensuite dans l'Inspecteur :
+
+| Section | Réglages |
+|---|---|
+| Suivi TAPNext | Fichier `.tapfx` · **Groupe** (numéro affiché dans la liste de Studio, 0 = tous les points) · Décalage d'image · Sortie · Afficher les points |
+| Forme | Forme (cercle, carré, carré arrondi, losange, triangle, hexagone, étoile, croix, anneau, image PNG) · image de forme · taille · opacité · rotation · orienter selon le mouvement · variation de taille |
+| Réaction au mouvement | Grossir avec la vitesse · étirer dans la direction · agrandissement maximal |
+| Apparition | **Toujours visible** · fondu d'apparition (activable, durée) · fondu de disparition (activable, durée) |
+| Fusion et bords | Fusion des formes · seuil · douceur |
+| Effets | Traînée · lissage des trajectoires · inverser la matte |
+
+**Sortie** :
+- **Image + alpha** (par défaut) : l'image ne change pas et la matte est dans l'alpha. Dans la page Color, utilisez la sortie Key du nœud, ou mettez l'effet dans un nœud et reliez son alpha à l'entrée Key du nœud de correction.
+- **Matte N&B** : la matte en blanc sur noir.
+- **Aperçu** : les formes en rouge sur l'image.
+
+Pour donner un style différent à chaque groupe, posez un effet par groupe, chacun avec son numéro de groupe.
+
+Si les formes sont en avance ou en retard sur l'image, ajustez le **Décalage d'image**. L'image 0 du fichier correspond à la première image du média source.
+
+Installation : `INSTALLER_Windows.bat` copie l'effet dans `C:\Program Files\Common Files\OFX\Plugins` (Windows demande une autorisation administrateur). Redémarrez ensuite Resolve. Pour une installation manuelle, copiez le dossier `ofx_plugin\dist\TAPNextShapes.ofx.bundle` à cet endroit. Sous Linux : `sudo ./ofx_plugin/install_ofx.sh`. Sous macOS : compilez avec `ofx_plugin/CMakeLists.txt`.
+
+> L'effet ne fait pas le suivi lui-même. Un effet OFX calcule chaque image séparément, alors que TAPNext++ doit lire tout le plan dans l'ordre, sur le GPU. Le suivi est donc calculé une fois dans Studio, et l'effet dessine les formes à partir de ce suivi. C'est instantané, et chaque réglage se voit tout de suite.
 
 ---
 

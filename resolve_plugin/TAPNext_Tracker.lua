@@ -448,6 +448,12 @@ function M.import_results(resolve, root, job_text, done_text)
       "nœuds (ou clic droit → Add Matte), puis reliez sa sortie bleue (Key) à l'entrée Key " ..
       "du nœud à corriger."
   end
+  local tapfx = M.json_field(done_text, "tapfx")
+  if tapfx and tapfx ~= "" then
+    report[#report + 1] = "✔ Suivi prêt pour l'effet OFX « TAPNext Shapes » : Effets → OpenFX → " ..
+      "TAPNext → TAPNext Shapes (posé sur un nœud de la page Color ou sur le clip). " ..
+      "Le fichier de suivi est rempli automatiquement ; réglez les formes dans l'Inspecteur."
+  end
   local mode = M.json_field(done_text, "fusion_mode") or "none"
   if mode ~= "none" then
     local comp, rstart = M.get_comp(ctx)

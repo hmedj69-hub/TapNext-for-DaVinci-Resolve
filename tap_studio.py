@@ -374,6 +374,11 @@ class ExportThread(QThread):
                                       outlier_px=max(2.0, 0.002 * info.width))
                     outputs.append(p)
                     j.setdefault("settings", {})[mode] = p
+            # Fichier de suivi pour l'effet OFX « TAPNext Shapes » de Resolve.
+            tapfx = base + ".tapfx"
+            se.export_tapfx(tapfx, res, j["point_groups"], info.width, info.height, info.fps)
+            outputs.append(tapfx)
+            j["tapfx"] = tapfx
             if j["matte"]:
                 outputs += se.write_shapes_video(
                     base, info, j["codec"], j["layers"], j["invert"], j["preview"],
@@ -1457,7 +1462,7 @@ class StudioWindow(QMainWindow):
         for i, g in enumerate(self.groups):
             n = int((self.pgroup == g.id).sum())
             mode = "découpe" if g.style.mode == "subtract" else se.SHAPE_LABELS[g.style.shape].lower()
-            it = QListWidgetItem(color_icon(g.color), f"{g.name}   ·  {n} pts  ·  {mode}")
+            it = QListWidgetItem(color_icon(g.color), f"{i + 1}. {g.name}   ·  {n} pts  ·  {mode}")
             it.setFlags(it.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEditable)
             it.setCheckState(Qt.Checked if g.enabled else Qt.Unchecked)
             it.setData(Qt.UserRole, g.id)
@@ -1487,6 +1492,9 @@ class StudioWindow(QMainWindow):
             return
         g.enabled = it.checkState() == Qt.Checked
         text = it.text().split("   ·  ")[0].strip()
+        num = f"{self.groups.index(g) + 1}. "
+        if text.startswith(num):
+            text = text[len(num):].strip()
         if text and text != g.name:
             g.name = text
             QTimer.singleShot(0, self._refresh_group_list)
@@ -1950,6 +1958,8 @@ class StudioWindow(QMainWindow):
         layers = [(se.ShapeStyle.from_dict(g.style.to_dict()), self._group_data(g), g.enabled)
                   for g in groups]
         keep = [i for i, L in enumerate(layers) if L[1] is not None]
+        gindex = {g.id: k for k, g in enumerate(groups)}
+        point_groups = np.array([gindex.get(int(v), 0) for v in self.pgroup[:self.n_tracked]], np.int32)
         job = dict(
             info=info, res=self.res, rd=self.rd, pts=self.pts[:self.n_tracked],
             out_dir=out_dir, name=name,
@@ -1963,6 +1973,7 @@ class StudioWindow(QMainWindow):
             preview=self.cb_preview.isChecked(),
             layers=[layers[i] for i in keep], group_names=[groups[i].name for i in keep],
             per_group=self.cb_per_group.isChecked(), invert=self.cb_invert.isChecked(),
+            point_groups=point_groups,
             ref_frame=ref, job_mode=bool(self.job),
             seg_in=int((self.job or {}).get("start", self.seg_in)),
             params=dict(start_frame=ref, segment=[self.seg_in, self.seg_out],
@@ -2006,6 +2017,7 @@ class StudioWindow(QMainWindow):
                         query_frame=job["ref_frame"], job_id=str(self.job.get("job_id", "")),
                         fusion_mode=mode,
                         fusion_smooth=job["fusion_smooth"], attach=self.cb_attach.isChecked(),
+                        tapfx=job.get("tapfx", ""),
                         **{f"setting_{k}": v for k, v in job.get("settings", {}).items()})
             with open(self.job["done"], "w", encoding="utf-8") as f:
                 json.dump(done, f, ensure_ascii=False, indent=1)

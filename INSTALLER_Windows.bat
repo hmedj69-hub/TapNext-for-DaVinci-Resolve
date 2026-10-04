@@ -27,7 +27,7 @@ echo   Telechargement total : ~5 Go (PyTorch CUDA + modele 2,5 Go)
 echo.
 
 REM ---------------------------------------------------------------- 1. uv
-echo [1/7] Gestionnaire de paquets uv...
+echo [1/8] Gestionnaire de paquets uv...
 if exist "%UV%" goto :uv_ok
 if not exist "%TOOLS%" mkdir "%TOOLS%"
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
@@ -42,7 +42,7 @@ if not exist "%UV%" goto :fail_uv
 echo       OK
 
 REM ------------------------------------------------------------ 2. Python
-echo [2/7] Python 3.11 (local, n'affecte pas le systeme)...
+echo [2/8] Python 3.11 (local, n'affecte pas le systeme)...
 if not exist "%PY%" goto :py_make
 REM Environnement existant sans Tk (ancienne installation) : on le recree
 "%PY%" -c "import tkinter" >nul 2>&1
@@ -55,7 +55,7 @@ if errorlevel 1 goto :fail
 echo       OK
 
 REM ----------------------------------------------------------- 3. PyTorch
-echo [3/7] PyTorch...
+echo [3/8] PyTorch...
 set "TORCH_INDEX=https://download.pytorch.org/whl/cpu"
 where nvidia-smi >nul 2>&1
 if errorlevel 1 goto :torch_cpu
@@ -71,12 +71,12 @@ echo       pilote NVIDIA puis relancez ce script si vous avez une carte RTX.
 if errorlevel 1 goto :fail
 
 REM ------------------------------------------------------- 4. Dependances
-echo [4/7] OpenCV, ffmpeg et autres dependances...
+echo [4/8] OpenCV, ffmpeg et autres dependances...
 "%UV%" pip install --python "%PY%" opencv-python numpy einops tqdm imageio-ffmpeg
 if errorlevel 1 goto :fail
 
 REM ---------------------------------------------------------- 5. TAPNext++
-echo [5/7] TAPNext++ (google-deepmind/tapnet)...
+echo [5/8] TAPNext++ (google-deepmind/tapnet)...
 "%UV%" pip install --python "%PY%" --no-deps --reinstall-package tapnet "tapnet @ https://github.com/google-deepmind/tapnet/archive/refs/heads/main.zip"
 if not errorlevel 1 goto :tapnet_ok
 echo       Archive indisponible, essai via git...
@@ -85,14 +85,19 @@ if errorlevel 1 goto :fail
 :tapnet_ok
 
 REM ------------------------------------------------------------ 6. Modele
-echo [6/7] Modele TAPNext++ 512 px (~2,5 Go, une seule fois)...
+echo [6/8] Modele TAPNext++ 512 px (~2,5 Go, une seule fois)...
 "%PY%" -c "import tap_resolve_tool as t; print('      ', t.ensure_checkpoint(None, 512))"
 if errorlevel 1 goto :fail
 
 REM ------------------------------------------------------- 7. Verification
-echo [7/7] Verification...
+echo [7/8] Verification...
 "%PY%" -c "import tkinter, torch, cv2, imageio_ffmpeg; from tapnet.tapnextpp.votsp2026.model import TAPNextPP; c=torch.cuda.is_available(); print('       PyTorch', torch.__version__, '| CUDA :', c, '|', torch.cuda.get_device_name(0) if c else 'CPU'); print('       OpenCV', cv2.__version__, '| ffmpeg OK | Tk OK | TAPNext++ OK')"
 if errorlevel 1 goto :fail
+
+REM ------------------------------------------------ 8. Integration Resolve
+echo [8/8] Integration dans DaVinci Resolve (Workspace ^> Scripts)...
+"%PY%" "%ROOT%resolve_plugin\install_resolve_plugin.py"
+if errorlevel 1 echo       ATTENTION : integration Resolve impossible, voir README.
 
 REM Raccourci sur le Bureau
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
@@ -105,6 +110,8 @@ echo    Installation terminee !
 echo    - Double-cliquez sur "TAPNext_Resolve.bat" (ou le raccourci
 echo      "TAPNext++ Resolve" du Bureau) pour ouvrir l'interface.
 echo    - Vous pouvez aussi glisser une video sur TAPNext_Resolve.bat.
+echo    - Dans DaVinci Resolve (a redemarrer s'il etait ouvert) :
+echo      Workspace ^> Scripts ^> TAPNext_Tracker
 echo  ============================================================
 echo.
 pause

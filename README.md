@@ -33,6 +33,8 @@ requirements.txt
    - Vous pouvez aussi glisser une vidéo sur `TAPNext_Resolve.bat` : elle est pré-remplie.
    - `TAPNext_CLI.bat` donne accès à la ligne de commande. Glisser une vidéo dessus lance un traitement avec les réglages par défaut.
 
+4. **Dans DaVinci Resolve** (redémarrez-le s'il était ouvert) : placez la tête de lecture sur un clip, puis **Workspace → Scripts → TAPNext_Tracker**. Voir la section [Intégration dans DaVinci Resolve](#-intégration-dans-davinci-resolve).
+
 **Linux / macOS** : `./install.sh`, puis `./TAPNext_Resolve.sh`. Sur macOS, il n'y a pas de CUDA : l'outil tourne sur CPU.
 
 Pour désinstaller, supprimez le dossier, ainsi que le raccourci du Bureau.
@@ -42,8 +44,29 @@ Pour désinstaller, supprimez le dossier, ainsi que le raccourci du Bureau.
 | `INSTALLER_Windows.bat` / `install.sh` | Installation automatique (via [uv](https://github.com/astral-sh/uv)) |
 | `TAPNext_Resolve.bat` / `.sh` | Interface graphique (`tap_gui.py`) |
 | `TAPNext_CLI.bat` | Ligne de commande |
+| `resolve_plugin/TAPNext_Tracker.lua` | Script intégré à Resolve (installé automatiquement) |
 
 > Pourquoi pas un seul `.exe` ? PyTorch avec CUDA pèse à lui seul ~3 Go, et le modèle 2,5 Go. Un exécutable unique dépasserait 5 Go, serait lent à démarrer et souvent bloqué par les antivirus. L'installateur produit le même résultat, mais il est réparable et peut être mis à jour.
+
+---
+
+## 🎬 Intégration dans DaVinci Resolve
+
+L'installateur ajoute un script Lua dans le menu **Workspace → Scripts → TAPNext_Tracker**. Il est disponible sur toutes les pages et fonctionne sans Python côté Resolve, car Resolve exécute le Lua nativement.
+
+1. Dans la page **Edit** ou **Color**, placez la tête de lecture sur le clip à traiter.
+2. Ouvrez **Workspace → Scripts → TAPNext_Tracker**. Une fenêtre de réglages s'ouvre : mode des points (grille ou clic sur l'image), taille et fusion des blobs, réaction au mouvement, fondus, résolution du modèle, nœud Fusion.
+   La plage d'images est pré-remplie avec la partie du clip utilisée dans la timeline. Seule cette partie est suivie, ce qui va beaucoup plus vite que de traiter le média entier.
+3. Cliquez sur **Lancer le tracking**. Le moteur tourne en arrière-plan, et la fenêtre affiche la progression et le journal. Pour annuler, fermez la fenêtre « TAPNext++ » réduite dans la barre des tâches.
+4. À la fin, le script fait automatiquement :
+   - **Matte** : elle est attachée au clip dans le Media Pool (*clip matte*). Dans la page **Color**, faites clic droit dans l'éditeur de nœuds → **Add Matte**, puis reliez la sortie bleue à l'entrée Key du nœud de correction. Cette dernière étape reste manuelle, car l'API de Resolve ne permet pas de câbler les nœuds de la page Color.
+   - **Fusion** (si demandé) : le nœud est ajouté dans la comp Fusion du clip, avec des images-clés calées sur la numérotation de la comp. En mode **Stabiliser**, il est directement inséré avant `MediaOut1`. En mode **Match-move**, il est ajouté sans connexion : branchez votre élément dessus.
+5. Les fichiers (matte, CSV, journal, `.setting`) sont rangés dans un dossier `TAPNext/` à côté du média source. Si ce dossier n'est pas accessible en écriture, ils vont dans `output/` du dossier de l'outil.
+
+Remarques :
+- Si vous déplacez le dossier de l'outil, relancez `INSTALLER_Windows.bat`, ou bien `.venv\Scripts\python resolve_plugin\install_resolve_plugin.py`. Le chemin peut aussi être corrigé dans le champ « Dossier de l'outil » de la fenêtre.
+- Pourquoi un script et pas un effet OFX ? Un effet OFX calcule chaque image indépendamment, et souvent dans le désordre. TAPNext++ doit au contraire lire la séquence dans l'ordre, en gardant une mémoire d'une image à l'autre, et il a besoin de PyTorch et du GPU. L'approche « script + moteur externe » est celle qu'utilisent la plupart des outils d'IA pour Resolve.
+- Correspondance des images Fusion : l'image source *f* devient l'image de comp *f − in_point + RenderStart*. Si votre comp utilise une autre numérotation, le fichier `.setting` peut être régénéré avec `fusion_export.py --frame-offset`.
 
 ---
 

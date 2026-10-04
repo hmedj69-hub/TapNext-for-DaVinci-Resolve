@@ -84,10 +84,46 @@ Mesuré sur une vidéo de test au mouvement connu (rotation + translation) :
    - **Aperçu stabilisé** : la vue montre directement le résultat. Les points doivent rester immobiles.
    - La **frise de temps** colore chaque image selon la qualité du calcul : vert < 0,7 px, jaune < 2 px, rouge au-delà.
 3. **Insertion planaire** (modèle Perspective) : glissez les **4 coins orange** sur la surface à remplacer. Ils suivent la surface sur tout le plan.
-4. **④ Export → Nœuds Fusion** :
+4. **⑤ Export → Nœuds Fusion** :
    - **Stabilisation** : nœud `Transform`, ou `CornerPositioner` en perspective. Depuis Resolve, il peut être **branché directement** dans la comp du clip.
    - **Match-move** : accroche un élément (texte, logo) au mouvement.
    - **Insertion planaire** : un `CornerPositioner` sur les 4 coins. Branchez votre image d'insertion dessus, puis fusionnez-la sur le plan.
+
+---
+
+## 🧊 Tracker 3D, profondeur, ombres et échos (onglet ④ 3D de Studio)
+
+### Ce que ça calcule
+- **Caméra 3D** (équivalent du *Camera Tracker* de Fusion ou de SynthEyes) : à partir des points suivis, Studio retrouve le **mouvement réel de la caméra dans l'espace** et la **position 3D de chaque point**. Technique : couple d'images initial (matrice essentielle), ajout des images par PnP RANSAC, triangulation, puis **ajustement de faisceaux** (bundle adjustment robuste). La **focale est estimée automatiquement** si vous ne la connaissez pas. Si la caméra ne fait que pivoter (panoramique sur pied), Studio le détecte et donne une caméra « rotation seule ».
+- **Profondeur de l'image** : une carte de profondeur par image avec l'IA *Depth Anything V2*. Ces réseaux scintillent d'une image à l'autre. Studio les **stabilise avec les points TAPNext++**, car un même point physique doit garder la même profondeur. Si la caméra 3D est résolue, les cartes sont **calées sur la vraie géométrie** des points 3D.
+- **Profondeur de chaque point**, à chaque image : c'est ce qu'utilisent les formes (perspective, plage de profondeur, brume, ombres, time-slice).
+
+TAPNext++ convient bien à ce travail : ses pistes sont **longues** et survivent aux occultations, ce qui donne beaucoup d'observations par point (le solveur 3D en a besoin). Le flux optique sous-pixel garde l'erreur de reprojection basse. Sa faiblesse, des points qui glissent sur les objets en mouvement, est filtrée par RANSAC et par l'ajustement robuste.
+
+### Utilisation
+1. **① Suivi** : pour la caméra, posez une zone de points sur le **décor fixe**, bien répartie (avant-plan et fond). Pour jouer avec des formes, posez aussi vos groupes sur les sujets.
+2. **④ 3D** :
+   - **Résoudre la caméra 3D** : choisissez le groupe du décor. Laissez *Focale automatique* cochée, ou entrez l'angle de champ s'il est connu. Les **croix cyan** sont les points 3D reprojetés : elles doivent coller à l'image. L'erreur doit idéalement rester sous 1 px.
+   - **Calculer la profondeur** : environ 0,1 s par image sur la RTX 3080. Le modèle (~100 Mo) est téléchargé au premier usage. Vue **« Profondeur »** : rouge = proche, bleu = loin.
+3. **② Formes** : chaque groupe a trois nouvelles sections (voir le tableau plus bas). Pour démarrer, essayez les préréglages **Profondeur + ombre**, **Échos fantômes** et **Slit-scan**.
+4. **⑤ Export** :
+   - **Caméra 3D Fusion** : nœud `TAP_Camera3D` animé, avec ouverture et focale, plus des repères `TAP_Point3D` (Locator3D) sur des points réels de la scène. Depuis Resolve, ils sont collés dans la comp du clip. Reliez la caméra et vos objets 3D à un `Merge3D`, puis à un `Renderer3D` : les objets restent collés à la scène.
+   - Fichiers `_points3d.ply` (nuage de points, pour Blender ou d'autres logiciels) et `_camera.json` (caméra par image).
+   - **Vidéo de profondeur** `_depth.mov` (blanc = proche), importée dans le chutier TAPNext. Elle sert de matte externe pour isoler un plan de profondeur, ou de carte pour un flou de profondeur.
+   - Le fichier `.tapfx` contient la profondeur de chaque point : l'effet OFX dispose des mêmes réglages de profondeur, d'ombre et d'écho.
+
+### Effets créatifs
+| Effet | Réglages | Idée |
+|---|---|---|
+| **Perspective** | Profondeur → Perspective | Les formes rapetissent avec la distance, comme de vrais objets. |
+| **Plage de profondeur** | Garder à partir de / jusqu'à, fondu | Masque seulement le premier plan, ou seulement le fond, avec une transition douce. |
+| **Brume** | Brume | Les formes lointaines s'effacent. |
+| **Ombre portée** | Direction, distance, flou, opacité | Ombre douce derrière le masque. Avec *Distance selon la profondeur*, les formes proches projettent une ombre plus éloignée : effet de relief. |
+| **Écho temporel** | Nombre, intervalle, atténuation, échelle | Copies passées du masque qui se superposent et s'estompent : traînées fantômes, effet stroboscopique. |
+| **Slit-scan** | Horizontal, vertical ou radial, décalage max. | Chaque bande de l'image montre un instant différent : déformation temporelle façon *2001*. |
+| **Time-slice par profondeur** | Décalage max. | Le premier plan est en avance sur le fond : le masque se « déplie » dans la profondeur. |
+
+> Limites : la caméra 3D a besoin d'un **déplacement** de la caméra (parallaxe). Un plan fixe ou un panoramique pur ne donne pas de profondeur géométrique, mais la profondeur IA reste disponible. Les objets qui bougent dans la scène ne doivent pas servir au calcul de la caméra : utilisez un groupe posé sur le décor.
 
 ---
 
@@ -107,6 +143,9 @@ L'installateur ajoute un **vrai effet OpenFX** dans DaVinci Resolve. Toutes les 
 | Apparition | **Toujours visible** · fondu d'apparition (activable, durée) · fondu de disparition (activable, durée) |
 | Fusion et bords | Fusion des formes · seuil · douceur |
 | Effets | Traînée · lissage des trajectoires · inverser la matte |
+| Profondeur | Taille selon la profondeur · profondeur min./max. · fondu de la plage · brume (nécessite un export avec profondeur) |
+| Ombre portée | Ombre · direction · distance · flou · opacité · distance selon la profondeur |
+| Écho temporel / slit-scan | Mode (écho, slit-scan horizontal/vertical/radial, time-slice selon la profondeur) · nombre · intervalle · atténuation · échelle · décalage max. |
 
 **Sortie** :
 - **Image + alpha** (par défaut) : l'image ne change pas et la matte est dans l'alpha. Dans la page Color, utilisez la sortie Key du nœud, ou mettez l'effet dans un nœud et reliez son alpha à l'entrée Key du nœud de correction.
@@ -125,7 +164,7 @@ Installation : `INSTALLER_Windows.bat` copie l'effet dans `C:\Program Files\Comm
 
 ## 🖥️ TAPNext Studio, pas à pas
 
-Le panneau de droite a quatre onglets : **① Suivi**, **② Formes**, **③ Stabiliser** et **④ Export**.
+Le panneau de droite a cinq onglets : **① Suivi**, **② Formes**, **③ Stabiliser**, **④ 3D** et **⑤ Export**.
 
 | Étape | Ce que vous faites | Ce qui se passe |
 |---|---|---|
@@ -133,7 +172,8 @@ Le panneau de droite a quatre onglets : **① Suivi**, **② Formes**, **③ Sta
 | **Suivre** (①) | Réglez Début/Fin (**I**/**O**), puis **Lancer le suivi**. | Suivi **vers l'avant et vers l'arrière**, avec **contrôle aller-retour** : les points qui décrochent sont coupés à l'image exacte du décrochage. Si vous ajoutez des points ensuite, seuls les nouveaux sont suivis. |
 | **Formes** (②) | Choisissez un groupe dans la liste et réglez son style. Utilisez un **préréglage** pour démarrer vite. | Le rendu est en direct dans la vue « Image + matte » ou « Matte seule ». Le suivi n'est jamais recalculé. |
 | **Éditer à part** (②) | Outil **Sélection** (S) : glissez sur des points (**Maj** pour ajouter), puis **Nouveau groupe avec la sélection**. | Ces points ont désormais leur propre style. Par exemple, des étoiles sur une partie du sujet et des blobs ailleurs. |
-| **Exporter** (③) | Choisissez dossier, format, et éventuellement « une matte par groupe », les nœuds Fusion et la vidéo de contrôle. | La matte est rendue en pleine résolution (1080p ou 4K), et les CSV, JSON et `.setting` sont écrits. |
+| **3D** (④) | Résolvez la caméra 3D et/ou calculez la profondeur. | Les formes peuvent ensuite réagir à la profondeur (voir la section Tracker 3D). |
+| **Exporter** (⑤) | Choisissez dossier, format, et éventuellement « une matte par groupe », les nœuds Fusion et la vidéo de contrôle. | La matte est rendue en pleine résolution (1080p ou 4K), et les CSV, JSON et `.setting` sont écrits. |
 
 **Projet** : **Enregistrer le projet** (Ctrl+S) crée un fichier `.tapnext` qui contient les points, le suivi et les formes. Pour le rouvrir : **Ouvrir…**, ou glissez le fichier sur la fenêtre. Rien n'est à recalculer.
 
@@ -155,6 +195,9 @@ Le panneau de droite a quatre onglets : **① Suivi**, **② Formes**, **③ Sta
 | | Seuil, Douceur du bord | Taille de la fusion et adoucissement du contour. |
 | Effets | Traînée dans la matte | La forme laisse une traînée qui s'estompe sur N images. |
 | | Lissage des trajectoires | Supprime les micro-tremblements. |
+| Profondeur | Perspective, plage gardée, fondu, brume | Nécessite l'onglet ④ 3D. 0 = proche, 1 = loin. |
+| Ombre portée | Direction, distance, flou, opacité, selon la profondeur | Ombre douce derrière les formes. |
+| Écho temporel / slit-scan | Mode, nombre, intervalle, atténuation, échelle, décalage max. | Superpose le masque dans le temps (échos, slit-scan, time-slice). |
 
 Les **valeurs par défaut** reprennent vos réglages : taille 4 px, fusion 0,10, seuil 0,10, douceur 0, grossir 0,1, étirer 0,195, fondus désactivés, lissage 2,1 et matte finale inversée. Le bouton **Style par défaut** enregistre le style courant pour les prochains groupes.
 
@@ -164,20 +207,6 @@ Conseils pour un suivi de qualité :
 - Posez les points sur une image **nette**, où le sujet est bien visible. Si le sujet change beaucoup d'aspect au cours du plan, ajoutez une seconde zone sur une autre image.
 - Gardez **Précision maximale (512 px)** et le **contrôle aller-retour**.
 - Entourez **le sujet seul** : des points posés sur le fond suivent le fond.
-
----|---|---|
-| **① Placer les points** | Allez sur une image où le sujet est bien visible et **entourez-le** avec l'outil **Zone (lasso)** ou **Zone (rectangle)**. | La zone se remplit automatiquement de points (80 par défaut) placés sur les **détails texturés**, ceux que TAPNext++ suit le mieux, en évitant les aplats. L'outil **Point** pose un point précis. **Clic droit** supprime un point, **Ctrl+Z** annule. Vous pouvez poser des points sur plusieurs images différentes. |
-| **② Suivre** | Réglez Début/Fin (touches **I**/**O**), puis cliquez sur **Lancer le suivi**. | Chaque point est suivi **vers l'avant et vers l'arrière** depuis l'image où il a été posé. Le **contrôle aller-retour** re-suit chaque piste à l'envers : si elle ne revient pas à son point de départ, elle est **coupée à l'image exacte où elle a décroché**. Les masques ne « glissent » donc plus sur le décor. Si vous ajoutez des points ensuite, seuls les nouveaux sont suivis. |
-| **③ Vérifier** | **Espace** pour lire, **←/→** image par image, molette pour zoomer, clic milieu pour se déplacer. | Les points s'affichent avec leurs **traînées**. Un point creux et gris est occulté. Un point qui a mal suivi se supprime d'un clic droit, sans relancer le suivi. |
-| **④ Matte** | Vue **Image + matte** ou **Matte seule**, puis réglez rayon, fusion, seuil, douceur, réaction au mouvement et fondus. | Le rendu est **instantané** et ne relance pas le suivi. Les blobs fusionnent en une forme continue qui épouse le sujet. |
-| **⑤ Exporter** | Choisissez dossier, format (ProRes, DNxHR, H.264, PNG), données et nœuds Fusion, puis **Exporter**. | La matte est rendue en pleine résolution (1080p ou 4K), et le CSV, le JSON et les fichiers `.setting` sont écrits. |
-
-Raccourcis : **Espace** lecture · **←/→** image · **I/O** début/fin · **F** cadrer · **Z** lasso · **R** rectangle · **A** point · **Ctrl+Z** annuler · **Ctrl+O** ouvrir.
-
-Conseils pour un suivi de qualité :
-- Posez les points sur une image **nette**, où le sujet est bien visible. Si le sujet change beaucoup d'aspect au cours du plan, ajoutez une seconde zone sur une autre image.
-- Gardez **Précision maximale (512 px)** et le **contrôle aller-retour**. Le contrôle double le temps de calcul, mais il élimine les pistes qui décrochent.
-- Entourez **le sujet seul**. Des points posés sur le fond suivent le fond.
 
 ---
 
@@ -193,7 +222,7 @@ python -m venv .venv
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 
 # 2) Dépendances de l'outil
-pip install opencv-python numpy einops tqdm imageio-ffmpeg
+pip install opencv-python numpy einops tqdm imageio-ffmpeg PySide6-Essentials scipy transformers
 
 # 3) TAPNext++ (dépôt DeepMind). --no-deps évite d'installer JAX/Haiku/TensorFlow,
 #    inutiles pour l'inférence PyTorch.

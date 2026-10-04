@@ -451,6 +451,14 @@ function M.import_results(resolve, root, job_text, done_text)
       "nœuds (ou clic droit → Add Matte), puis reliez sa sortie bleue (Key) à l'entrée Key " ..
       "du nœud à corriger."
   end
+  local depth = M.json_field(done_text, "depth_video")
+  if depth and depth ~= "" then
+    if M.import_to_bin(resolve, depth) then
+      report[#report + 1] = "✔ Vidéo de profondeur (blanc = proche) importée dans le chutier « TAPNext »."
+    else
+      report[#report + 1] = "✘ Import de la vidéo de profondeur impossible : " .. depth
+    end
+  end
   local tapfx = M.json_field(done_text, "tapfx")
   if tapfx and tapfx ~= "" then
     report[#report + 1] = "✔ Suivi prêt pour l'effet OFX « TAPNext Shapes » : Effets → OpenFX → " ..
@@ -458,9 +466,10 @@ function M.import_results(resolve, root, job_text, done_text)
       "Le fichier de suivi est rempli automatiquement ; réglez les formes dans l'Inspecteur."
   end
   local labels = { stabilize = "TAP_Stabilize (stabilisation)", matchmove = "TAP_MatchMove (match-move)",
-    cornerpin = "TAP_CornerPin (insertion 4 coins)" }
+    cornerpin = "TAP_CornerPin (insertion 4 coins)",
+    camera3d = "TAP_Camera3D (caméra 3D + repères TAP_Point3D)" }
   local wanted = {}
-  for _, md in ipairs({ "stabilize", "matchmove", "cornerpin" }) do
+  for _, md in ipairs({ "stabilize", "matchmove", "cornerpin", "camera3d" }) do
     local f = M.json_field(done_text, "setting_" .. md)
     if f and f ~= "" then wanted[#wanted + 1] = { md, f } end
   end
@@ -481,6 +490,12 @@ function M.import_results(resolve, root, job_text, done_text)
         end
       end
       report[#report + 1] = "→ Page Fusion : la comp du clip contient les nœuds TAP_…"
+      for _, w in ipairs(wanted) do
+        if w[1] == "camera3d" then
+          report[#report + 1] = "→ Caméra 3D : reliez TAP_Camera3D et vos objets 3D à un Merge3D, " ..
+            "puis à un Renderer3D ; les TAP_Point3D marquent des points réels de la scène."
+        end
+      end
     else
       report[#report + 1] = "✘ Comp Fusion introuvable pour ce clip."
     end

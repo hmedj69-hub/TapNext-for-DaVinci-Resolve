@@ -27,6 +27,13 @@ import tap_resolve_tool as eng
 
 SHAPES = ["circle", "square", "rounded", "diamond", "triangle", "hexagon",
           "star", "cross", "ring", "image"]
+ECHO_MODES = ["none", "echo", "slit_h", "slit_v", "slit_radial", "slit_depth"]
+ECHO_LABELS = {
+    "none": "Aucun", "echo": "Écho (copies dans le temps)",
+    "slit_h": "Slit-scan horizontal", "slit_v": "Slit-scan vertical",
+    "slit_radial": "Slit-scan radial", "slit_depth": "Time-slice selon la profondeur",
+}
+
 SHAPE_LABELS = {
     "circle": "Cercle", "square": "Carré", "rounded": "Carré arrondi",
     "diamond": "Losange", "triangle": "Triangle", "hexagon": "Hexagone",
@@ -62,6 +69,26 @@ class ShapeStyle:
     # --- effets
     trail: int = 0                    # traînée : nombre d'images
     smooth: float = 2.1               # lissage des trajectoires (images)
+    # --- profondeur (0 = proche, 1 = loin ; voir depth_engine / camera_solver)
+    depth_scale: float = 0.0          # taille selon la profondeur (perspective)
+    depth_near: float = 0.0           # plage de profondeur gardée
+    depth_far: float = 1.0
+    depth_feather: float = 0.05
+    depth_fog: float = 0.0            # opacité réduite avec la distance
+    # --- ombre portée
+    shadow_on: bool = False
+    shadow_angle: float = 135.0       # direction (degrés, 0 = droite, 90 = bas)
+    shadow_dist: float = 12.0         # pixels source
+    shadow_soft: float = 6.0          # flou (pixels source)
+    shadow_opacity: float = 0.6
+    shadow_depth: bool = False        # objets proches → ombre plus décalée
+    # --- écho temporel / slit-scan
+    echo_mode: str = "none"           # none · echo · slit_h · slit_v · slit_radial · slit_depth
+    echo_count: int = 4
+    echo_step: int = 3                # images entre deux échos
+    echo_decay: float = 0.6           # opacité multipliée à chaque écho
+    echo_scale: float = 1.0           # taille multipliée à chaque écho
+    slit_span: int = 24               # décalage temporel maximal (images)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -85,6 +112,14 @@ PRESETS: Dict[str, dict] = {
                        follow_motion=True, grow=0.2, stretch=0.0, fade_in_on=True, fade_out_on=True),
     "Découpe (trous)": dict(mode="subtract", shape="circle", size=30, merge=0.5, threshold=0.5,
                             softness=0.06, grow=0.0, stretch=0.0),
+    "Échos fantômes": dict(shape="circle", size=24, merge=0.4, threshold=0.45, softness=0.08,
+                           grow=0.0, stretch=0.0, echo_mode="echo", echo_count=6, echo_step=3,
+                           echo_decay=0.65, echo_scale=0.92),
+    "Slit-scan": dict(shape="circle", size=30, merge=0.6, threshold=0.5, softness=0.06,
+                      grow=0.0, stretch=0.0, echo_mode="slit_h", slit_span=30, always_visible=True),
+    "Profondeur + ombre": dict(shape="circle", size=20, merge=0.0, softness=0.05, grow=0.0,
+                               stretch=0.0, depth_scale=0.8, depth_fog=0.4, shadow_on=True,
+                               shadow_depth=True, shadow_dist=18, shadow_soft=8, shadow_opacity=0.5),
 }
 
 
@@ -153,6 +188,7 @@ class GroupData:
     direction: np.ndarray  # [T, n, 2]
     jitter: np.ndarray     # [n] facteur de taille
     ids: np.ndarray        # [n] indices des points (colonnes du suivi)
+    depth: Optional[np.ndarray] = None   # [T, n] profondeur 0..1 (0 = proche)
 
 
 def valid_mask(res: "eng.TrackResult", cols: np.ndarray) -> np.ndarray:
@@ -170,7 +206,7 @@ def valid_mask(res: "eng.TrackResult", cols: np.ndarray) -> np.ndarray:
 
 
 def prepare_group(res: "eng.TrackResult", cols: np.ndarray, st: ShapeStyle,
-                  vis_threshold: float = 0.5) -> GroupData:
+                  vis_threshold: float = 0.5, depth: Optional[np.ndarray] = None) -> GroupData:
     cols = np.asarray(cols, int)
     sub = eng.TrackResult(res.positions[:, cols], res.visibility[:, cols], res.tracked)
     smoothed = eng.smooth_tracks(sub.positions, sub.visibility, st.smooth)
@@ -189,8 +225,21 @@ def prepare_group(res: "eng.TrackResult", cols: np.ndarray, st: ShapeStyle,
         speed = np.where(visible, velocity, 0.0).astype(np.float32)
     rng = np.random.default_rng(1234)
     jit = 1.0 + st.size_jitter * (rng.random(res.positions.shape[1]) * 2 - 1)
+    d = None
+    if depth is not None:
+        d = depth[:, cols].astype(np.float32)
+        # profondeur maintenue pendant les occultations (dernière valeur connue)
+        for j in range(d.shape[1]):
+            v = d[:, j]
+            okd = np.isfinite(v)
+            if okd.any():
+                idx = np.where(okd, np.arange(len(v)), 0)
+                np.maximum.accumulate(idx, out=idx)
+                first = int(np.argmax(okd))
+                v[:first] = v[first]
+                d[:, j] = v[idx]
     return GroupData(pos, alpha.astype(np.float32), speed, direction,
-                     jit[cols].astype(np.float32), cols)
+                     jit[cols].astype(np.float32), cols, d)
 
 
 # =============================================================================
@@ -270,27 +319,59 @@ class ShapeRenderer:
             else:
                 cv2.fillPoly(canvas, [p], value, cv2.LINE_AA, self.SHIFT)
 
-    def _stamps_for(self, st: ShapeStyle, gd: GroupData, t: int):
+    def _stamps_for(self, st: ShapeStyle, gd: GroupData, t: int, scale: float = 1.0,
+                    shadow: bool = False):
         """Liste (cx, cy, sx, sy, angle, alpha) en pixels de travail."""
         out = []
+        T = len(gd.alpha)
         trail = max(0, int(st.trail))
-        base = st.size * self.rs
+        base = st.size * self.rs * scale
+        n = len(gd.ids)
+        # time-slice selon la profondeur : chaque point vit dans son propre passé
+        tj0 = np.full(n, t, int)
+        if st.echo_mode == "slit_depth" and gd.depth is not None and 0 <= t < T:
+            dd = np.nan_to_num(gd.depth[t], nan=0.0)
+            tj0 = t - np.round(dd * max(1, st.slit_span)).astype(int)
+        ca, sa = math.cos(math.radians(st.shadow_angle)), math.sin(math.radians(st.shadow_angle))
         for k in range(0, trail + 1):
-            tk = t - k
-            if tk < 0:
-                break
             fade = 1.0 - k / (trail + 1.0)
-            pos, al, sp, dv = gd.pos[tk], gd.alpha[tk], gd.speed[tk], gd.direction[tk]
-            for j in np.nonzero((al > 1.0 / 255) & np.isfinite(pos[:, 0]))[0]:
-                v = float(sp[j]) * self.vnorm
+            for j in range(n):
+                tk = int(tj0[j]) - k
+                if tk < 0 or tk >= T:
+                    continue
+                al = float(gd.alpha[tk, j])
+                x, y = gd.pos[tk, j]
+                if al <= 1.0 / 255 or not np.isfinite(x):
+                    continue
+                spd = float(gd.speed[tk, j])
+                v = spd * self.vnorm
                 g = min(st.max_scale, 1.0 + st.grow * v)
                 s = min(st.max_scale, 1.0 + st.stretch * v)
                 r = base * float(gd.jitter[j]) * g * (fade if k else 1.0)
+                d = float(gd.depth[tk, j]) if gd.depth is not None else float("nan")
+                if np.isfinite(d):
+                    if st.depth_scale > 0:
+                        r *= (1 - st.depth_scale) + st.depth_scale * (1.6 - 1.2 * d)
+                    if st.depth_near > 0 or st.depth_far < 1:
+                        fe = max(1e-3, st.depth_feather)
+                        a_in = np.clip((d - (st.depth_near - fe)) / fe, 0, 1)
+                        a_out = np.clip(((st.depth_far + fe) - d) / fe, 0, 1)
+                        al *= float(a_in * a_out)
+                    if st.depth_fog > 0:
+                        al *= 1.0 - st.depth_fog * d
+                if al <= 1.0 / 255:
+                    continue
                 ang = st.rotation
-                if (st.follow_motion or st.stretch > 0) and sp[j] > 0.05:
-                    ang += math.degrees(math.atan2(dv[j, 1], dv[j, 0]))
-                out.append((pos[j, 0] * self.rs, pos[j, 1] * self.rs, max(0.5, r * s), max(0.5, r),
-                            ang, float(al[j]) * (fade if k else 1.0)))
+                if (st.follow_motion or st.stretch > 0) and spd > 0.05:
+                    dv = gd.direction[tk, j]
+                    ang += math.degrees(math.atan2(dv[1], dv[0]))
+                cx, cy = x * self.rs, y * self.rs
+                if shadow:
+                    dist = st.shadow_dist * self.rs
+                    if st.shadow_depth and np.isfinite(d):
+                        dist *= 0.25 + 1.5 * (1.0 - d)
+                    cx, cy = cx + ca * dist, cy + sa * dist
+                out.append((cx, cy, max(0.5, r * s), max(0.5, r), ang, al * (fade if k else 1.0)))
         out.sort(key=lambda e: e[5])
         return out
 
@@ -306,12 +387,18 @@ class ShapeRenderer:
             return cv2.resize(small, (self.w, self.h), interpolation=cv2.INTER_LINEAR)
         return cv2.GaussianBlur(x, (0, 0), sigma)
 
-    def render_group(self, st: ShapeStyle, gd: GroupData, t: int) -> np.ndarray:
-        """Matte float32 [h, w] (résolution de travail) d'un groupe."""
-        stamps = self._stamps_for(st, gd, t)
+    def _blurf(self, x: np.ndarray, sigma: float) -> np.ndarray:
+        if sigma <= 0.3:
+            return x
+        return self._blur((np.clip(x, 0, 1) * 255).astype(np.uint8), sigma)
+
+    def _core(self, st: ShapeStyle, gd: GroupData, t: int, scale: float = 1.0,
+              shadow: bool = False) -> np.ndarray:
+        """Matte d'un groupe à l'instant t (sans écho, ombre ni opacité)."""
+        stamps = self._stamps_for(st, gd, t, scale, shadow)
         if not stamps:
             return np.zeros((self.h, self.w), np.float32)
-        base = max(0.5, st.size * self.rs)
+        base = max(0.5, st.size * self.rs * scale)
         if st.merge > 0:
             shape = np.zeros((self.h, self.w), np.uint8)
             amap = np.zeros_like(shape)
@@ -334,6 +421,61 @@ class ShapeRenderer:
             for cx, cy, sx, sy, ang, al in stamps:
                 self._draw(canvas, st, cx, cy, sx, sy, ang, int(round(al * 255)))
             m = self._blur(canvas, st.softness * base * 2.0)
+        return m
+
+    def _slit_map(self, mode: str) -> np.ndarray:
+        key = (mode, self.w, self.h)
+        if getattr(self, "_slit_key", None) != key:
+            yy, xx = np.mgrid[0:self.h, 0:self.w].astype(np.float32)
+            if mode == "slit_h":
+                f = xx / max(1, self.w - 1)
+            elif mode == "slit_v":
+                f = yy / max(1, self.h - 1)
+            else:
+                cx, cy = (self.w - 1) / 2, (self.h - 1) / 2
+                f = np.hypot(xx - cx, yy - cy) / math.hypot(cx, cy)
+            self._slit_key, self._slit_f = key, f
+        return self._slit_f
+
+    def _timed(self, st: ShapeStyle, gd: GroupData, t: int) -> np.ndarray:
+        """Écho temporel / slit-scan."""
+        mode = st.echo_mode
+        if mode == "echo":
+            m = self._core(st, gd, t)
+            for k in range(1, max(0, int(st.echo_count)) + 1):
+                tk = t - k * max(1, int(st.echo_step))
+                if tk < 0:
+                    break
+                mk = self._core(st, gd, tk, scale=st.echo_scale ** k) * (st.echo_decay ** k)
+                m = np.maximum(m, mk)
+            return m
+        if mode in ("slit_h", "slit_v", "slit_radial"):
+            span = max(1, int(st.slit_span))
+            K = min(12, span + 1)
+            times = [max(0, t - int(round(i * span / (K - 1)))) for i in range(K)]
+            layers = [self._core(st, gd, tk) for tk in times]
+            f = self._slit_map(mode) * (K - 1)
+            i0 = np.clip(np.floor(f).astype(int), 0, K - 1)
+            i1 = np.clip(i0 + 1, 0, K - 1)
+            a = f - i0
+            stack = np.stack(layers)
+            yy, xx = np.indices(f.shape)
+            return stack[i0, yy, xx] * (1 - a) + stack[i1, yy, xx] * a
+        return self._core(st, gd, t)
+
+    def render_group(self, st: ShapeStyle, gd: GroupData, t: int) -> np.ndarray:
+        """Matte float32 [h, w] (résolution de travail) d'un groupe."""
+        m = self._timed(st, gd, t)
+        if st.shadow_on and st.shadow_opacity > 0:
+            if st.shadow_depth and gd.depth is not None:
+                sh = self._core(st, gd, t, shadow=True)
+            else:
+                dist = st.shadow_dist * self.rs
+                dx = math.cos(math.radians(st.shadow_angle)) * dist
+                dy = math.sin(math.radians(st.shadow_angle)) * dist
+                sh = cv2.warpAffine(m, np.float32([[1, 0, dx], [0, 1, dy]]), (self.w, self.h))
+            sh = self._blurf(sh, st.shadow_soft * self.rs) * st.shadow_opacity
+            m = m + sh * (1.0 - m)
         return m * float(st.opacity)
 
     def render(self, layers: Sequence[tuple], t: int, invert: bool = False,
@@ -368,21 +510,28 @@ class ShapeRenderer:
 # =============================================================================
 
 def export_tapfx(path: str, res: "eng.TrackResult", point_groups: np.ndarray,
-                 width: int, height: int, fps: float) -> str:
+                 width: int, height: int, fps: float,
+                 depth: Optional[np.ndarray] = None) -> str:
     """Écrit le fichier binaire lu par le plugin OFX (voir TAPNextShapes.cpp).
 
     point_groups : [Q] numéro de groupe (0, 1, 2… dans l'ordre de Studio).
+    depth : [T, Q] profondeur 0..1 (0 = proche, NaN = inconnue) → format v2.
     """
     T, Q = res.visibility.shape
     valid = valid_mask(res, np.arange(Q))
     with open(path, "wb") as f:
-        f.write(b"TAPFX01\0")
+        f.write(b"TAPFX02\0" if depth is not None else b"TAPFX01\0")
         np.array([width, height, T, Q, 0, 0, 0, 0], "<i4").tofile(f)
         np.array([fps], "<f4").tofile(f)
         np.ascontiguousarray(res.positions, "<f4").tofile(f)
         np.ascontiguousarray(res.visibility, "<f4").tofile(f)
         np.ascontiguousarray(valid, np.uint8).tofile(f)
         np.ascontiguousarray(point_groups, "<i4").tofile(f)
+        if depth is not None:
+            d = np.full((T, Q), np.nan, np.float32)
+            n = min(T, len(depth))
+            d[:n] = np.asarray(depth, np.float32)[:n, :Q]
+            np.ascontiguousarray(d, "<f4").tofile(f)
     remember_last_tapfx(path)
     return path
 

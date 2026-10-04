@@ -9,6 +9,7 @@
 //   char[8] "TAPFX01\0" · int32 W, H, T, Q, first_frame, reserved[3] · float32 fps
 //   float32 pos[T][Q][2] (pixels source, NaN = absent) · float32 vis[T][Q]
 //   uint8 valid[T][Q] (suivi et non coupé) · int32 group[Q]
+//   version 2 ("TAPFX02") : + float32 depth[T][Q] (0 = proche, 1 = loin, NaN = inconnue)
 //
 // Licence : MIT (code TAPNext) ; en-têtes OpenFX sous licence BSD.
 
@@ -93,7 +94,18 @@ struct Params {
   double smooth = 2.1;
   bool invert = true;
   bool showPoints = false;
+  // profondeur
+  double depthScale = 0.0, depthNear = 0.0, depthFar = 1.0, depthFeather = 0.05, depthFog = 0.0;
+  // ombre portée
+  bool shadowOn = false, shadowDepth = false;
+  double shadowAngle = 135.0, shadowDist = 12.0, shadowSoft = 6.0, shadowOpacity = 0.6;
+  // écho / slit-scan
+  int echoMode = 0, echoCount = 4, echoStep = 3, slitSpan = 24;
+  double echoDecay = 0.6, echoScale = 1.0;
 };
+enum EchoMode { kEchoNone, kEcho, kSlitH, kSlitV, kSlitRadial, kSlitDepth };
+const char* kEchoLabels[] = {"Aucun", "Écho (copies dans le temps)", "Slit-scan horizontal",
+                             "Slit-scan vertical", "Slit-scan radial", "Time-slice selon la profondeur"};
 
 // ---------------------------------------------------------------------------
 // Fichiers (chemins UTF-8, y compris sous Windows : accents, etc.)
@@ -135,6 +147,7 @@ struct TrackFile {
   std::vector<float> pos, vis;
   std::vector<uint8_t> valid;
   std::vector<int32_t> group;
+  std::vector<float> depth;  // vide si fichier v1
 };
 
 bool loadTrackFile(const std::string& path, TrackFile& tf) {
@@ -143,15 +156,21 @@ bool loadTrackFile(const std::string& path, TrackFile& tf) {
   if (!f) return false;
   char magic[8];
   int32_t hdr[8];
-  if (!readAll(f.get(), magic, 8) || std::memcmp(magic, "TAPFX01", 7) != 0) return false;
+  if (!readAll(f.get(), magic, 8) || std::memcmp(magic, "TAPFX0", 6) != 0) return false;
+  const int version = magic[6] - '0';
   if (!readAll(f.get(), hdr, sizeof(hdr)) || !readAll(f.get(), &tf.fps, 4)) return false;
   tf.W = hdr[0]; tf.H = hdr[1]; tf.T = hdr[2]; tf.Q = hdr[3]; tf.first = hdr[4];
   if (tf.W <= 0 || tf.H <= 0 || tf.T <= 0 || tf.Q <= 0 || tf.T > 1000000 || tf.Q > 1000000)
     return false;
   const size_t n = size_t(tf.T) * tf.Q;
   tf.pos.resize(n * 2); tf.vis.resize(n); tf.valid.resize(n); tf.group.resize(tf.Q);
-  return readAll(f.get(), tf.pos.data(), n * 2 * 4) && readAll(f.get(), tf.vis.data(), n * 4) &&
-         readAll(f.get(), tf.valid.data(), n) && readAll(f.get(), tf.group.data(), size_t(tf.Q) * 4);
+  bool ok = readAll(f.get(), tf.pos.data(), n * 2 * 4) && readAll(f.get(), tf.vis.data(), n * 4) &&
+            readAll(f.get(), tf.valid.data(), n) && readAll(f.get(), tf.group.data(), size_t(tf.Q) * 4);
+  if (ok && version >= 2) {
+    tf.depth.resize(n);
+    if (!readAll(f.get(), tf.depth.data(), n * 4)) tf.depth.clear();
+  }
+  return ok;
 }
 
 // Données préparées pour un groupe (dépendent du lissage et des fondus).
@@ -162,6 +181,7 @@ struct Prepared {
   std::vector<float> speed;  // T*n
   std::vector<float> dir;    // T*n*2
   std::vector<float> jit;    // n
+  std::vector<float> depth;  // T*n (vide si pas de profondeur)
 };
 
 inline bool finite(float v) { return std::isfinite(v); }
@@ -258,6 +278,19 @@ void prepare(const TrackFile& tf, const Params& p, Prepared& out) {
         if (V(t, j) >= 0.5f && finite(sm[i2])) { nx = sm[i2]; ny = sm[i2 + 1]; }
         if (!seenBefore[t] && finite(nx)) { out.pos[i2] = nx; out.pos[i2 + 1] = ny; }
       }
+    }
+  }
+  // 3b) profondeur maintenue pendant les occultations
+  if (!tf.depth.empty()) {
+    out.depth.assign(size_t(T) * n, NAN);
+    for (int j = 0; j < n; ++j) {
+      float last = NAN, firstv = NAN;
+      for (int t = 0; t < T; ++t) {
+        float d = tf.depth[size_t(t) * tf.Q + cols[j]];
+        if (finite(d)) { last = d; if (!finite(firstv)) firstv = d; }
+        out.depth[size_t(t) * n + j] = last;
+      }
+      for (int t = 0; t < T && !finite(out.depth[size_t(t) * n + j]); ++t) out.depth[size_t(t) * n + j] = firstv;
     }
   }
   // 4) variation de taille déterministe par point
@@ -438,20 +471,28 @@ void gaussBlur(Canvas& c, double sigma) {
 }
 
 // Matte du temps t (index dans le fichier), à la résolution de travail ww×wh.
-void renderMatte(const TrackFile& tf, const Prepared& pr, const Params& p, const Stamp* stamp,
-                 int t, int ww, int wh, std::vector<float>& out) {
+// Matte d'un groupe à l'instant t (sans écho, ombre, opacité ni inversion).
+void renderCore(const TrackFile& tf, const Prepared& pr, const Params& p, const Stamp* stamp,
+                int t, int ww, int wh, float scale, bool shadow, std::vector<float>& out) {
   const float rs = float(ww) / tf.W;            // pixels de travail par pixel source
   const float rsy = float(wh) / tf.H;
   const float vnorm = 1080.f / tf.H;
-  const float base = std::max(0.5f, float(p.size) * rs);
+  const float base = std::max(0.5f, float(p.size) * rs * scale);
+  const bool hasDepth = !pr.depth.empty();
   struct S { float cx, cy, sx, sy, ang, al; };
   std::vector<S> st;
   const int trail = std::max(0, p.trail);
+  const float ca = std::cos(float(p.shadowAngle * kPi / 180)), sa = std::sin(float(p.shadowAngle * kPi / 180));
   for (int k = 0; k <= trail; ++k) {
-    int tk = t - k;
-    if (tk < 0) break;
     float fade = 1.f - k / (trail + 1.f);
     for (int j = 0; j < pr.n; ++j) {
+      int t0 = t;
+      if (p.echoMode == kSlitDepth && hasDepth && t >= 0 && t < pr.T) {
+        float d0 = pr.depth[size_t(t) * pr.n + j];
+        if (finite(d0)) t0 = t - int(std::lround(d0 * std::max(1, p.slitSpan)));
+      }
+      int tk = t0 - k;
+      if (tk < 0 || tk >= pr.T) continue;
       size_t i = size_t(tk) * pr.n + j;
       float al = pr.alpha[i];
       float x = pr.pos[i * 2], y = pr.pos[i * 2 + 1];
@@ -460,10 +501,28 @@ void renderMatte(const TrackFile& tf, const Prepared& pr, const Params& p, const
       float g = std::min(float(p.maxScale), 1.f + float(p.grow) * v);
       float s = std::min(float(p.maxScale), 1.f + float(p.stretch) * v);
       float r = base * pr.jit[j] * g * (k ? fade : 1.f);
+      float d = hasDepth ? pr.depth[i] : NAN;
+      if (finite(d)) {
+        if (p.depthScale > 0) r *= float((1 - p.depthScale) + p.depthScale * (1.6 - 1.2 * d));
+        if (p.depthNear > 0 || p.depthFar < 1) {
+          float fe = float(std::max(1e-3, p.depthFeather));
+          float ain = std::min(1.f, std::max(0.f, (d - float(p.depthNear - fe)) / fe));
+          float aout = std::min(1.f, std::max(0.f, (float(p.depthFar + fe) - d) / fe));
+          al *= ain * aout;
+        }
+        if (p.depthFog > 0) al *= float(1.0 - p.depthFog * d);
+      }
+      if (al <= 1.f / 255) continue;
       float ang = float(p.rotation);
       if ((p.follow || p.stretch > 0) && pr.speed[i] > 0.05f)
         ang += std::atan2(pr.dir[i * 2 + 1], pr.dir[i * 2]) * 180.f / float(kPi);
-      st.push_back({x * rs, y * rsy, std::max(0.5f, r * s), std::max(0.5f, r), ang, al * (k ? fade : 1.f)});
+      float cx = x * rs, cy = y * rsy;
+      if (shadow) {
+        float dist = float(p.shadowDist) * rs;
+        if (p.shadowDepth && finite(d)) dist *= 0.25f + 1.5f * (1.f - d);
+        cx += ca * dist; cy += sa * dist;
+      }
+      st.push_back({cx, cy, std::max(0.5f, r * s), std::max(0.5f, r), ang, al * (k ? fade : 1.f)});
     }
   }
   Canvas m;
@@ -490,9 +549,76 @@ void renderMatte(const TrackFile& tf, const Prepared& pr, const Params& p, const
     for (auto& s : st) drawShape(m, p, stamp, s.cx, s.cy, s.sx, s.sy, s.ang, s.al);
     gaussBlur(m, p.softness * base * 2.0);
   }
-  const float op = float(p.opacity);
-  for (auto& v : m.v) { v *= op; if (p.invert) v = 1.f - v; }
   out.swap(m.v);
+}
+
+// Écho temporel / slit-scan.
+void renderTimed(const TrackFile& tf, const Prepared& pr, const Params& p, const Stamp* stamp,
+                 int t, int ww, int wh, std::vector<float>& out) {
+  if (p.echoMode == kEcho) {
+    renderCore(tf, pr, p, stamp, t, ww, wh, 1.f, false, out);
+    std::vector<float> mk;
+    for (int k = 1; k <= std::max(0, p.echoCount); ++k) {
+      int tk = t - k * std::max(1, p.echoStep);
+      if (tk < 0) break;
+      renderCore(tf, pr, p, stamp, tk, ww, wh, float(std::pow(p.echoScale, k)), false, mk);
+      float dec = float(std::pow(p.echoDecay, k));
+      for (size_t i = 0; i < out.size(); ++i) out[i] = std::max(out[i], mk[i] * dec);
+    }
+    return;
+  }
+  if (p.echoMode == kSlitH || p.echoMode == kSlitV || p.echoMode == kSlitRadial) {
+    const int span = std::max(1, p.slitSpan);
+    const int K = std::min(12, span + 1);
+    std::vector<std::vector<float>> layers(K);
+    for (int i = 0; i < K; ++i) {
+      int tk = std::max(0, t - int(std::lround(double(i) * span / (K - 1))));
+      renderCore(tf, pr, p, stamp, tk, ww, wh, 1.f, false, layers[i]);
+    }
+    out.assign(size_t(ww) * wh, 0.f);
+    const float cx = (ww - 1) / 2.f, cy = (wh - 1) / 2.f, rmax = std::sqrt(cx * cx + cy * cy);
+    for (int y = 0; y < wh; ++y)
+      for (int x = 0; x < ww; ++x) {
+        float f = p.echoMode == kSlitH ? x / float(std::max(1, ww - 1))
+                : p.echoMode == kSlitV ? y / float(std::max(1, wh - 1))
+                : std::sqrt((x - cx) * (x - cx) + (y - cy) * (y - cy)) / rmax;
+        float fi = f * (K - 1);
+        int i0 = std::max(0, std::min(K - 1, int(std::floor(fi)))), i1 = std::min(K - 1, i0 + 1);
+        float a = fi - i0;
+        size_t idx = size_t(y) * ww + x;
+        out[idx] = layers[i0][idx] * (1 - a) + layers[i1][idx] * a;
+      }
+    return;
+  }
+  renderCore(tf, pr, p, stamp, t, ww, wh, 1.f, false, out);
+}
+
+// Matte finale d'un temps t : écho/slit-scan, ombre portée, opacité, inversion.
+void renderMatte(const TrackFile& tf, const Prepared& pr, const Params& p, const Stamp* stamp,
+                 int t, int ww, int wh, std::vector<float>& out) {
+  renderTimed(tf, pr, p, stamp, t, ww, wh, out);
+  if (p.shadowOn && p.shadowOpacity > 0) {
+    const float rs = float(ww) / tf.W;
+    Canvas sh;
+    sh.init(ww, wh);
+    if (p.shadowDepth && !pr.depth.empty()) {
+      renderCore(tf, pr, p, stamp, t, ww, wh, 1.f, true, sh.v);
+    } else {
+      float dist = float(p.shadowDist) * rs;
+      int dx = int(std::lround(std::cos(p.shadowAngle * kPi / 180) * dist));
+      int dy = int(std::lround(std::sin(p.shadowAngle * kPi / 180) * dist));
+      for (int y = 0; y < wh; ++y)
+        for (int x = 0; x < ww; ++x) {
+          int sx = x - dx, sy = y - dy;
+          if (sx >= 0 && sx < ww && sy >= 0 && sy < wh) sh.v[size_t(y) * ww + x] = out[size_t(sy) * ww + sx];
+        }
+    }
+    gaussBlur(sh, p.shadowSoft * rs);
+    const float so = float(p.shadowOpacity);
+    for (size_t i = 0; i < out.size(); ++i) out[i] = out[i] + sh.v[i] * so * (1.f - out[i]);
+  }
+  const float op = float(p.opacity);
+  for (auto& v : out) { v *= op; if (p.invert) v = 1.f - v; }
 }
 
 // ---------------------------------------------------------------------------
@@ -616,7 +742,11 @@ void defGroup(OfxParamSetHandle ps, const char* name, const char* label, bool op
 const char* kParamNames[] = {"file", "group", "offset", "output", "showPoints", "shape", "image",
                              "size", "opacity", "rotation", "follow", "jitter", "grow", "stretch",
                              "maxScale", "always", "fadeInOn", "fadeIn", "fadeOutOn", "fadeOut",
-                             "merge", "threshold", "softness", "trail", "smooth", "invert"};
+                             "merge", "threshold", "softness", "trail", "smooth", "invert",
+                             "depthScale", "depthNear", "depthFar", "depthFeather", "depthFog",
+                             "shadowOn", "shadowAngle", "shadowDist", "shadowSoft", "shadowOpacity",
+                             "shadowDepth", "echoMode", "echoCount", "echoStep", "echoDecay",
+                             "echoScale", "slitSpan"};
 
 void describeParams(OfxImageEffectHandle desc) {
   OfxParamSetHandle ps;
@@ -663,6 +793,30 @@ void describeParams(OfxImageEffectHandle desc) {
   defInt(ps, "trail", "Traînée (images)", 0, 0, 30, "gFx");
   defDouble(ps, "smooth", "Lissage des trajectoires", 2.1, 0.0, 5.0, "gFx");
   defBool(ps, "invert", "Inverser la matte", true, "gFx");
+
+  defGroup(ps, "gDepth", "Profondeur (tracker 3D)", false);
+  defDouble(ps, "depthScale", "Taille selon la profondeur", 0.0, 0.0, 1.0, "gDepth",
+            "Proches plus gros, lointains plus petits (perspective)");
+  defDouble(ps, "depthNear", "Profondeur min. (0 = proche)", 0.0, 0.0, 1.0, "gDepth");
+  defDouble(ps, "depthFar", "Profondeur max. (1 = loin)", 1.0, 0.0, 1.0, "gDepth");
+  defDouble(ps, "depthFeather", "Fondu de la plage", 0.05, 0.0, 0.5, "gDepth");
+  defDouble(ps, "depthFog", "Brume (opacité selon distance)", 0.0, 0.0, 1.0, "gDepth");
+
+  defGroup(ps, "gShadow", "Ombre portée", false);
+  defBool(ps, "shadowOn", "Ombre portée", false, "gShadow");
+  defDouble(ps, "shadowAngle", "Direction (°)", 135.0, -180.0, 360.0, "gShadow");
+  defDouble(ps, "shadowDist", "Distance (px)", 12.0, 0.0, 400.0, "gShadow");
+  defDouble(ps, "shadowSoft", "Flou (px)", 6.0, 0.0, 100.0, "gShadow");
+  defDouble(ps, "shadowOpacity", "Opacité", 0.6, 0.0, 1.0, "gShadow");
+  defBool(ps, "shadowDepth", "Distance selon la profondeur", false, "gShadow");
+
+  defGroup(ps, "gEcho", "Écho temporel / slit-scan", false);
+  defChoice(ps, "echoMode", "Mode", kEchoLabels, 6, kEchoNone, "gEcho");
+  defInt(ps, "echoCount", "Nombre d'échos", 4, 1, 30, "gEcho");
+  defInt(ps, "echoStep", "Intervalle (images)", 3, 1, 60, "gEcho");
+  defDouble(ps, "echoDecay", "Atténuation", 0.6, 0.0, 1.0, "gEcho");
+  defDouble(ps, "echoScale", "Échelle par écho", 1.0, 0.3, 2.0, "gEcho");
+  defInt(ps, "slitSpan", "Décalage temporel max. (images)", 24, 1, 240, "gEcho");
 }
 
 Params readParams(Instance* in, OfxTime t) {
@@ -679,6 +833,12 @@ Params readParams(Instance* in, OfxTime t) {
   B("fadeOutOn", p.fadeOutOn); I("fadeOut", p.fadeOut); D("merge", p.merge);
   D("threshold", p.threshold); D("softness", p.softness); I("trail", p.trail);
   D("smooth", p.smooth); B("invert", p.invert);
+  D("depthScale", p.depthScale); D("depthNear", p.depthNear); D("depthFar", p.depthFar);
+  D("depthFeather", p.depthFeather); D("depthFog", p.depthFog);
+  B("shadowOn", p.shadowOn); D("shadowAngle", p.shadowAngle); D("shadowDist", p.shadowDist);
+  D("shadowSoft", p.shadowSoft); D("shadowOpacity", p.shadowOpacity); B("shadowDepth", p.shadowDepth);
+  I("echoMode", p.echoMode); I("echoCount", p.echoCount); I("echoStep", p.echoStep);
+  D("echoDecay", p.echoDecay); D("echoScale", p.echoScale); I("slitSpan", p.slitSpan);
   return p;
 }
 

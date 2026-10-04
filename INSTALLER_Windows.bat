@@ -67,7 +67,7 @@ if errorlevel 1 goto :fail
 
 REM ------------------------------------------------------- 4. Dependances
 echo [4/9] OpenCV, ffmpeg, interface Qt et autres dependances...
-"%UV%" pip install --python "%PY%" opencv-python numpy einops tqdm imageio-ffmpeg PySide6-Essentials
+"%UV%" pip install --python "%PY%" opencv-python numpy einops tqdm imageio-ffmpeg PySide6-Essentials scipy transformers
 if errorlevel 1 goto :fail
 
 REM ---------------------------------------------------------- 5. TAPNext++
@@ -86,7 +86,7 @@ if errorlevel 1 goto :fail
 
 REM ------------------------------------------------------- 7. Verification
 echo [7/9] Verification...
-"%PY%" -c "import PySide6, torch, cv2, imageio_ffmpeg; from tapnet.tapnextpp.votsp2026.model import TAPNextPP; c=torch.cuda.is_available(); print('       PyTorch', torch.__version__, '| CUDA :', c, '|', torch.cuda.get_device_name(0) if c else 'CPU'); print('       OpenCV', cv2.__version__, '| ffmpeg OK | Qt OK | TAPNext++ OK')"
+"%PY%" -c "import PySide6, torch, cv2, imageio_ffmpeg, scipy, transformers; from tapnet.tapnextpp.votsp2026.model import TAPNextPP; c=torch.cuda.is_available(); print('       PyTorch', torch.__version__, '| CUDA :', c, '|', torch.cuda.get_device_name(0) if c else 'CPU'); print('       OpenCV', cv2.__version__, '| ffmpeg OK | Qt OK | 3D OK | TAPNext++ OK')"
 if errorlevel 1 goto :fail
 
 REM ------------------------------------------------ 8. Integration Resolve

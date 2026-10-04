@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+checkpoints/
+*_matte.mov
+*_matte.mp4
+*_matte_png/
+*_preview.mp4

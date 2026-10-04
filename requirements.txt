@@ -1,0 +1,11 @@
+# Installer d'abord PyTorch avec CUDA (voir README) :
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+torch>=2.1
+torchvision
+opencv-python>=4.8
+numpy
+einops
+tqdm
+imageio-ffmpeg
+# TAPNext++ (non publié sur PyPI). Installez-le sans dépendances pour éviter JAX/TensorFlow :
+#   pip install --no-deps "tapnet @ git+https://github.com/google-deepmind/tapnet.git"

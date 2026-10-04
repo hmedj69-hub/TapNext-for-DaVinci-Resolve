@@ -22,6 +22,17 @@ Ctrl+A tout sélectionner · Ctrl+Z annuler · Ctrl+O ouvrir · Ctrl+S enregistr
 
 from __future__ import annotations
 
+import sys as _sys
+
+if "--job" in _sys.argv:  # signale tout de suite au script Resolve que Studio démarre
+    try:
+        _jp = _sys.argv[_sys.argv.index("--job") + 1]
+        import os as _os
+        with open(_os.path.join(_os.path.dirname(_jp), "resolve_started.txt"), "w") as _f:
+            _f.write("ok")
+    except Exception:
+        pass
+
 import argparse
 import json
 import os
@@ -350,15 +361,19 @@ class ExportThread(QThread):
                 params = dict(j["params"], query_frames=[int(v) for v in res.query_frames])
                 eng.export_json(base + "_tracks.json", info, j["pts"], params, len(res.tracked))
                 outputs += [csv_path, base + "_tracks.json"]
-            if j["fusion"] != "none":
-                modes = ["stabilize", "matchmove"] if j["fusion"] == "both" else [j["fusion"]]
+            fmode = j["fusion_to_resolve"] if j.get("job_mode") else j["fusion"]
+            if fmode != "none":
+                modes = ["stabilize", "matchmove"] if fmode == "both" else [fmode]
+                # Pour Resolve : image 0 de la comp = point d'entrée du clip.
+                offset = -int(j.get("seg_in", 0)) if j.get("job_mode") else 0
                 for mode in modes:
                     p = f"{base}_fusion_{mode}.setting"
                     fx.export_setting(csv_path, p, info.width, info.height, mode=mode,
                                       min_visibility=0.5, ref_frame=j["ref_frame"],
-                                      smooth_radius=j["fusion_smooth"],
+                                      smooth_radius=j["fusion_smooth"], frame_offset=offset,
                                       outlier_px=max(2.0, 0.002 * info.width))
                     outputs.append(p)
+                    j.setdefault("settings", {})[mode] = p
             if j["matte"]:
                 outputs += se.write_shapes_video(
                     base, info, j["codec"], j["layers"], j["invert"], j["preview"],
@@ -1949,6 +1964,7 @@ class StudioWindow(QMainWindow):
             layers=[layers[i] for i in keep], group_names=[groups[i].name for i in keep],
             per_group=self.cb_per_group.isChecked(), invert=self.cb_invert.isChecked(),
             ref_frame=ref, job_mode=bool(self.job),
+            seg_in=int((self.job or {}).get("start", self.seg_in)),
             params=dict(start_frame=ref, segment=[self.seg_in, self.seg_out],
                         groups=[dict(name=g.name, enabled=g.enabled, style=g.style.to_dict(),
                                      points=[int(i) for i in np.nonzero(self.pgroup[:self.n_tracked] == g.id)[0]])
@@ -1989,7 +2005,8 @@ class StudioWindow(QMainWindow):
                         csv=base + "_tracks.csv", outputs=outputs,
                         query_frame=job["ref_frame"], job_id=str(self.job.get("job_id", "")),
                         fusion_mode=mode,
-                        fusion_smooth=job["fusion_smooth"], attach=self.cb_attach.isChecked())
+                        fusion_smooth=job["fusion_smooth"], attach=self.cb_attach.isChecked(),
+                        **{f"setting_{k}": v for k, v in job.get("settings", {}).items()})
             with open(self.job["done"], "w", encoding="utf-8") as f:
                 json.dump(done, f, ensure_ascii=False, indent=1)
             self.job_sent = True

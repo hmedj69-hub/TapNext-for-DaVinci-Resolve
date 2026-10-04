@@ -97,6 +97,9 @@ CHECKPOINT_URLS = {
           "https://storage.googleapis.com/gresearch/tapnextpp/tapnextpp_512.ckpt"),
 }
 
+# Sous Windows, aucune fenêtre de console pour ffmpeg/ffprobe.
+NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform.startswith("win") else {}
+
 # Espace de coordonnées des prédictions TAPNext++ (toujours 256×256, quelle que
 # soit la résolution d'entrée : voir tapnet/tapnextpp/votsp2026/model.py).
 MODEL_COORD_SIZE = 256
@@ -138,7 +141,7 @@ def _probe_timecode(path: str) -> Optional[str]:
         out = subprocess.run(
             [ffprobe, "-v", "error", "-show_entries",
              "format_tags=timecode:stream_tags=timecode", "-of", "json", path],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=30, **NO_WINDOW,
         ).stdout
         data = json.loads(out or "{}")
         for s in data.get("streams", []):
@@ -237,7 +240,7 @@ class MatteWriter:
             cmd += ["-timecode", info.timecode]
         cmd.append(self.path)
         log.debug("ffmpeg: %s", " ".join(cmd))
-        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, **NO_WINDOW)
 
     def write(self, img: np.ndarray) -> None:
         if self.png_dir is not None:

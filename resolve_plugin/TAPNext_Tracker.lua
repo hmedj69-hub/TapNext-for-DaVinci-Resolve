@@ -61,20 +61,32 @@ function M.write_all(p, s)
   return true
 end
 
+function M.can_write(p)
+  local probe = M.join(p, ".tapnext_write_test")
+  local ok = M.write_all(probe, "ok")
+  if ok then os.remove(probe) end
+  return ok
+end
+
+--[[ Crée un dossier sans ouvrir de console : bmd.createdir (API Fusion) ;
+     la commande système n'est qu'un dernier recours. ]]
 function M.mkdir(p)
+  if M.can_write(p) then return true end
+  local b = rawget(_G, "bmd")
+  if b and b.createdir then
+    pcall(b.createdir, p)
+    if M.can_write(p) then return true end
+  end
   if M.IS_WIN then
     os.execute('if not exist "' .. p .. '" mkdir "' .. p .. '"')
   else
     os.execute("mkdir -p '" .. p:gsub("'", "'\\''") .. "'")
   end
+  return M.can_write(p)
 end
 
 function M.dir_writable(p)
-  M.mkdir(p)
-  local probe = M.join(p, ".tapnext_write_test")
-  local ok = M.write_all(probe, "ok")
-  if ok then os.remove(probe) end
-  return ok
+  return M.mkdir(p)
 end
 
 -- Sous Windows, le Lua de Resolve ouvre les fichiers et lance les commandes
@@ -124,8 +136,31 @@ end
 --[[ Boîte de dialogue native du système (ne dépend pas de UIManager, absent
      de certaines éditions de Resolve). Le texte passe par un fichier UTF-8
      pour conserver les accents. ]]
+function M.ui_message(text)
+  local f = rawget(_G, "fu") or rawget(_G, "fusion")
+  local ui = f and f.UIManager
+  local b = rawget(_G, "bmd")
+  if not (ui and b and b.UIDispatcher) then return false end
+  return pcall(function()
+    local disp = b.UIDispatcher(ui)
+    local win = disp:AddWindow({ ID = "TAPMsg", WindowTitle = "TAPNext++",
+      Geometry = { 320, 260, 560, 240 } },
+      ui:VGroup {
+        ui:Label { ID = "T", Text = text, WordWrap = true, Weight = 1 },
+        ui:HGroup { Weight = 0, ui:HGap(0, 1), ui:Button { ID = "Ok", Text = "OK" } },
+      })
+    local function close() disp:ExitLoop() end
+    win.On.Ok.Clicked = close
+    win.On.TAPMsg.Close = close
+    win:Show()
+    disp:RunLoop()
+    win:Hide()
+  end)
+end
+
 function M.message(root, text)
   print("[TAPNext] " .. text)
+  if M.ui_message(text) then return end
   local dir = M.root_is_valid(root) and M.join(root, "jobs") or nil
   if dir then M.mkdir(dir) end
   local file = dir and M.join(dir, "message.txt")
@@ -186,6 +221,39 @@ function M.studio_cmd(root, job_path)
     .. " --job " .. M.quote(job_path) .. " >/dev/null 2>&1 &"
 end
 
+function M.sleep(sec)
+  local b = rawget(_G, "bmd")
+  if b and b.wait then
+    if pcall(b.wait, sec) then return end
+  end
+  local t = os.clock() + sec
+  while os.clock() < t do end
+end
+
+--[[ Lance Studio sans fenêtre de console (bmd.executebg + pythonw). Studio
+     écrit jobs/resolve_started.txt dès son démarrage : sans ce signal après
+     quelques secondes, on se rabat sur la commande système classique. ]]
+function M.launch_studio(root, job_path)
+  local started = M.join(M.dirname(job_path), "resolve_started.txt")
+  os.remove(started)
+  local b = rawget(_G, "bmd")
+  if M.IS_WIN and b and b.executebg then
+    local pyw = M.join(root, ".venv", "Scripts", "pythonw.exe")
+    if M.exists(pyw) then
+      local ok = pcall(b.executebg, M.quote(pyw) .. " " .. M.quote(M.join(root, "tap_studio.py"))
+        .. " --job " .. M.quote(job_path))
+      if ok then
+        for _ = 1, 40 do
+          if M.exists(started) then return end
+          M.sleep(0.25)
+        end
+        M.log(root, "bmd.executebg sans effet : lancement classique.")
+      end
+    end
+  end
+  os.execute(M.studio_cmd(root, job_path))
+end
+
 function M.paths(root)
   local jobs = M.join(root, "jobs")
   return {
@@ -225,7 +293,33 @@ end
 function M.attach_matte(resolve, ctx, matte_path)
   local ms = resolve:GetMediaStorage()
   if not ms then return false end
-  return ms:AddClipMattesToMediaPool(ctx.mpi, { matte_path }) and true or false
+  local ok, res = pcall(function()
+    return ms:AddClipMattesToMediaPool(ctx.mpi, { matte_path })
+  end)
+  return ok and res and true or false
+end
+
+--[[ Importe un fichier dans le chutier « TAPNext » du Media Pool (créé si
+     besoin). Renvoie true si l'élément a été ajouté. ]]
+function M.import_to_bin(resolve, path)
+  local ok, res = pcall(function()
+    local proj = resolve:GetProjectManager():GetCurrentProject()
+    local mp = proj:GetMediaPool()
+    local rootf = mp:GetRootFolder()
+    local bin
+    for _, f in pairs(rootf:GetSubFolderList() or {}) do
+      if f:GetName() == "TAPNext" then bin = f end
+    end
+    if not bin then bin = mp:AddSubFolder(rootf, "TAPNext") end
+    local prev = mp:GetCurrentFolder()
+    if bin then mp:SetCurrentFolder(bin) end
+    local items = mp:ImportMedia({ path })
+    if prev then mp:SetCurrentFolder(prev) end
+    local n = 0
+    for _ in pairs(items or {}) do n = n + 1 end
+    return n > 0
+  end)
+  return ok and res
 end
 
 --[[ Comp Fusion du clip (créée si besoin) + décalage source → comp. ]]
@@ -239,23 +333,16 @@ function M.get_comp(ctx)
   end
   if not comp then return nil, 0 end
   local attrs = comp:GetAttrs() or {}
-  local start = tonumber(attrs.COMPN_RenderStart) or 0
-  -- image source f  →  image de comp  f - in_frame + RenderStart
-  return comp, math.floor(start - ctx.in_frame)
+  return comp, math.floor(tonumber(attrs.COMPN_RenderStart) or 0)
 end
 
-function M.make_setting(root, csv, mode, smooth, offset, out_path)
-  local args = {
-    M.python_exe(root), M.join(root, "fusion_export.py"), csv,
-    "--mode", mode, "--smooth=" .. M.fmt_num(smooth),
-    "--frame-offset=" .. M.fmt_num(offset), "-o", out_path,
-  }
-  local q = {}
-  for i, v in ipairs(args) do q[i] = M.quote(v) end
-  local cmd = table.concat(q, " ")
-  if M.IS_WIN then cmd = '"' .. cmd .. '"' end  -- règle de guillemets de cmd /c
-  os.execute(cmd)
-  return M.read_all(out_path)
+--[[ Les .setting de Studio ont l'image 0 = point d'entrée du clip ; on les
+     décale de RenderStart (souvent 0, parfois 1001). ]]
+function M.shift_setting(text, delta)
+  if not text or delta == 0 then return text end
+  return (text:gsub("%[(%-?%d+)%] = {", function(n)
+    return "[" .. (tonumber(n) + delta) .. "] = {"
+  end))
 end
 
 function M.paste_into_comp(comp, setting_text, insert_before_output)
@@ -347,36 +434,39 @@ function M.import_results(resolve, root, job_text, done_text)
     in_frame = tonumber(M.json_field(job_text, "start")) or 0,
   }
   local matte = M.json_field(done_text, "matte")
-  if matte and matte ~= "" and M.json_field(done_text, "attach") ~= "false" then
-    if M.attach_matte(resolve, ctx, matte) then
-      report[#report + 1] = "✔ Matte attachée au clip (Media Pool).\n" ..
-        "→ Page Color : clic droit dans la zone des nœuds → Add Matte → choisissez " ..
-        "la matte, puis reliez sa sortie bleue (Key) à l'entrée Key du nœud à corriger."
+  if matte and matte ~= "" then
+    if M.import_to_bin(resolve, matte) then
+      report[#report + 1] = "✔ Matte importée dans le Media Pool, chutier « TAPNext »."
     else
-      report[#report + 1] = "✘ Matte non attachée automatiquement ; importez-la : " .. matte
+      report[#report + 1] = "✘ Import de la matte dans le Media Pool impossible."
     end
+    if M.json_field(done_text, "attach") ~= "false" and M.attach_matte(resolve, ctx, matte) then
+      report[#report + 1] = "✔ Matte aussi attachée au clip (page Color → clic droit → Add Matte)."
+    end
+    report[#report + 1] = "   Fichier : " .. matte
+    report[#report + 1] = "→ Page Color : glissez la matte du chutier TAPNext dans la zone des " ..
+      "nœuds (ou clic droit → Add Matte), puis reliez sa sortie bleue (Key) à l'entrée Key " ..
+      "du nœud à corriger."
   end
   local mode = M.json_field(done_text, "fusion_mode") or "none"
-  local csv = M.json_field(done_text, "csv")
-  if mode ~= "none" and csv then
-    local comp, offset = M.get_comp(ctx)
+  if mode ~= "none" then
+    local comp, rstart = M.get_comp(ctx)
     if comp then
       local modes = (mode == "both") and { "stabilize", "matchmove" } or { mode }
-      local smooth = tonumber(M.json_field(done_text, "fusion_smooth")) or 0
       for _, md in ipairs(modes) do
-        local setting = M.join(P.dir, "resolve_fusion_" .. md .. ".setting")
-        local text = M.make_setting(root, csv, md, smooth, offset, setting)
-        if text then
+        local text = M.shift_setting(M.read_all(M.json_field(done_text, "setting_" .. md) or ""),
+          rstart)
+        if text and text ~= "" then
           -- Stabilisation seule : branchée avant MediaOut. « Les deux » : nœuds
           -- ajoutés sans branchement, l'image du clip n'est pas modifiée.
           local ok, msg = M.paste_into_comp(comp, text, mode == "stabilize")
-          if ok and mode == "both" then
+          if ok and mode ~= "stabilize" then
             msg = "Nœud " .. (md == "stabilize" and "TAP_Stabilize" or "TAP_MatchMove") ..
               " ajouté dans la comp Fusion (à brancher)."
           end
           report[#report + 1] = ok and ("✔ " .. msg) or "✘ Collage du nœud Fusion impossible."
         else
-          report[#report + 1] = "✘ Génération du nœud Fusion impossible (" .. md .. ")."
+          report[#report + 1] = "✘ Nœud Fusion « " .. md .. " » absent de l'export."
         end
       end
       report[#report + 1] = "→ Page Fusion : la comp du clip contient les nœuds TAP_…"
@@ -392,7 +482,8 @@ function M.finish_import(resolve, root, job_text, done_text)
   local report, ok = M.import_results(resolve, root, job_text, done_text)
   M.write_json(P.ack, { status = ok and "ok" or "error", report = table.concat(report, "\n"),
     job_id = M.json_field(job_text, "job_id") or "" })
-  os.rename(P.done, P.done .. ".imported")
+  os.remove(P.done .. ".imported")
+  if not os.rename(P.done, P.done .. ".imported") then os.remove(P.done) end
   for _, l in ipairs(report) do M.log(root, l) end
   return report, ok
 end
@@ -427,6 +518,13 @@ function M.main()
   -- 1) Un export Studio attend d'être importé ? → on l'importe.
   local done_text = M.read_all(P.done)
   local job_text = M.read_all(P.job)
+  local ack_text = M.read_all(P.ack)
+  if done_text and ack_text and M.json_field(ack_text, "job_id") ~= nil
+      and M.json_field(ack_text, "job_id") == M.json_field(done_text, "job_id") then
+    -- Déjà importé : on ne recommence pas, on passe à un nouveau suivi.
+    os.remove(P.done)
+    done_text = nil
+  end
   if done_text and job_text and M.json_field(done_text, "status") == "ok" then
     local report, ok = M.finish_import(resolve, root, job_text, done_text)
     M.message(root, "TAPNext++ — import dans Resolve\n\n" .. table.concat(report, "\n"))
@@ -457,7 +555,7 @@ function M.main()
     clip_name = ctx.name, job_id = job_id,
   })
   M.log(root, "Ouverture de TAPNext Studio : " .. ctx.path .. " [" .. ctx.in_frame .. "-" .. ctx.out_frame .. "]")
-  os.execute(M.studio_cmd(root, P.job))
+  M.launch_studio(root, P.job)
 
   -- 3) Attente de l'export (si la fenêtre d'état est disponible) ; sinon
   --    l'utilisateur relance le script après l'export pour importer.

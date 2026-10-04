@@ -35,6 +35,7 @@ if "--job" in _sys.argv:  # signale tout de suite au script Resolve que Studio d
 
 import argparse
 import json
+import math
 import os
 import sys
 import threading
@@ -56,9 +57,10 @@ from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import fusion_export as fx  # noqa: E402
+import motion_solver as ms  # noqa: E402
 import shape_engine as se  # noqa: E402
 import tap_resolve_tool as eng  # noqa: E402
+import track_refine as trf  # noqa: E402
 
 APP_NAME = "TAPNext Studio"
 PREVIEW_MAX_SIDE = 1280      # résolution des images gardées en mémoire (JPEG)
@@ -185,11 +187,12 @@ class TrackThread(QThread):
     done = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, store, pts, qf, seg_in, seg_out, input_res, verify, fp16):
+    def __init__(self, store, pts, qf, seg_in, seg_out, input_res, verify, fp16, refine=True):
         super().__init__()
         self.store, self.pts, self.qf = store, pts, qf
         self.seg_in, self.seg_out = seg_in, seg_out
         self.input_res, self.verify, self.fp16 = input_res, verify, fp16
+        self.refine = refine
         self.cancel = threading.Event()
 
     def run(self):
@@ -223,6 +226,11 @@ class TrackThread(QThread):
             res = eng.track_segment(
                 tracker, frames, self.seg_in, self.pts, self.qf, info.width, info.height,
                 self.store.total, self.verify, progress=self.progress.emit, cancel=self.cancel)
+            if self.refine:
+                # Hybride : précision sous-pixel (flux optique local) ancrée sur TAPNext++.
+                res.refine_stats = trf.refine_tracks(
+                    self.store.path, res, self.seg_in, self.seg_out, info.width, info.height,
+                    query_xy=self.pts, progress=self.progress.emit, cancel=self.cancel)
             res.elapsed = time.time() - t0
             res.device = str(tracker.device)
             self.done.emit(res)
@@ -314,6 +322,15 @@ class Timeline(QWidget):
             if idx.size:
                 p.fillRect(QRectF(self._x(idx[0]), y0 + h - 3, self._x(idx[-1]) - self._x(idx[0]) + 1, 3),
                            QColor("#5fd38a"))
+        # qualité du calcul de mouvement (onglet ③)
+        sol = w.solve
+        if sol is not None:
+            a, b = sol.frames
+            for f in range(a, b + 1):
+                m, r = int(sol.method[f]), sol.rms[f]
+                col = (QColor("#5a5b62") if m in (0, 3) else QColor("#5fd38a") if r < 0.7
+                       else QColor("#e6c14a") if r < 2.0 else QColor("#e5534b"))
+                p.fillRect(QRectF(self._x(f), y0 - 4, max(1.5, self._x(f + 1) - self._x(f)), 3), col)
         # images de pose des points
         if len(w.qf):
             p.setPen(QPen(QColor("#ffd34d"), 1))
@@ -355,25 +372,21 @@ class ExportThread(QThread):
             base = os.path.join(j["out_dir"], j["name"])
             outputs = []
             csv_path = base + "_tracks.csv"
-            if j["data"] or j["fusion"] != "none" or j.get("job_mode"):
+            if j["data"] or j.get("job_mode"):
                 self.progress.emit("Export des trajectoires", 0)
                 eng.export_csv(csv_path, rd.smoothed, res.visibility, rd.velocity, res.tracked)
                 params = dict(j["params"], query_frames=[int(v) for v in res.query_frames])
                 eng.export_json(base + "_tracks.json", info, j["pts"], params, len(res.tracked))
                 outputs += [csv_path, base + "_tracks.json"]
-            fmode = j["fusion_to_resolve"] if j.get("job_mode") else j["fusion"]
-            if fmode != "none":
-                modes = ["stabilize", "matchmove"] if fmode == "both" else [fmode]
-                # Pour Resolve : image 0 de la comp = point d'entrée du clip.
-                offset = -int(j.get("seg_in", 0)) if j.get("job_mode") else 0
-                for mode in modes:
-                    p = f"{base}_fusion_{mode}.setting"
-                    fx.export_setting(csv_path, p, info.width, info.height, mode=mode,
-                                      min_visibility=0.5, ref_frame=j["ref_frame"],
-                                      smooth_radius=j["fusion_smooth"], frame_offset=offset,
-                                      outlier_px=max(2.0, 0.002 * info.width))
-                    outputs.append(p)
-                    j.setdefault("settings", {})[mode] = p
+            # Nœuds Fusion calculés par le solveur de mouvement (onglet ③).
+            # Pour Resolve : image 0 de la comp = point d'entrée du clip.
+            offset = -int(j.get("seg_in", 0)) if j.get("job_mode") else 0
+            for mode, kind, M, quad, node in j["fusion_jobs"]:
+                p = f"{base}_fusion_{mode}.setting"
+                ms.write_setting(p, kind, M, info.width, info.height, j["frames"], offset,
+                                 quad=quad, name=node)
+                outputs.append(p)
+                j.setdefault("settings", {})[mode] = p
             # Fichier de suivi pour l'effet OFX « TAPNext Shapes » de Resolve.
             tapfx = base + ".tapfx"
             se.export_tapfx(tapfx, res, j["point_groups"], info.width, info.height, info.fps)
@@ -649,6 +662,19 @@ class Viewer(QWidget):
         if mode != "matte" or w.show_points_on_matte():
             self._draw_tracks(p)
         self._draw_zones(p)
+        q = w.quad_now()
+        if q is not None and np.all(np.isfinite(q)):
+            pts = [self.to_screen(x, y) for x, y in q]
+            p.setPen(QPen(QColor(ACCENT), 2))
+            p.setBrush(QColor(232, 131, 58, 35))
+            p.drawPolygon(QPolygonF(pts))
+            p.setBrush(QColor(ACCENT))
+            p.setPen(QPen(QColor("black"), 1))
+            for sp in pts:
+                p.drawRect(QRectF(sp.x() - 5, sp.y() - 5, 10, 10))
+        if w.stab_preview():
+            p.setPen(QColor(120, 220, 140))
+            p.drawText(QRectF(10, 26, 400, 18), Qt.AlignLeft, "Aperçu stabilisé")
         p.setPen(QColor(220, 220, 225, 200))
         p.drawText(QRectF(10, 8, 600, 18), Qt.AlignLeft,
                    f"Image {w.cur} / {w.n_frames() - 1}    {info.width}×{info.height}"
@@ -666,14 +692,18 @@ class Viewer(QWidget):
         nt = w.n_tracked
         cols = w.point_colors()
         sel = w.sel
-        if rd is not None and nt and t < len(rd.smoothed):
+        if rd is not None and nt and 0 <= t < len(rd.smoothed):
             pos, alpha, vis = rd.smoothed, rd.alpha, rd.visible
+            t0 = max(0, t - trail)
+            if w.stab_preview():   # trajectoires vues dans l'image stabilisée
+                D = np.stack([w.view_xy(tt, pos[tt, :nt]) for tt in range(t0, t + 1)])
+            else:
+                D = pos[t0:t + 1, :nt]
             if trail > 0:
-                t0 = max(0, t - trail)
                 for i in range(nt):
                     if alpha[t, i] < 0.05:
                         continue
-                    seg = pos[t0:t + 1, i]
+                    seg = D[:, i]
                     ok = vis[t0:t + 1, i] & np.isfinite(seg[:, 0])
                     path = QPainterPath()
                     started = False
@@ -692,7 +722,7 @@ class Viewer(QWidget):
                     p.setPen(QPen(col, max(1.0, size * 0.4)))
                     p.drawPath(path)
             for i in range(nt):
-                x, y = pos[t, i]
+                x, y = D[-1, i]
                 if not np.isfinite(x) or not res.tracked[t]:
                     continue
                 sp = self.to_screen(x, y)
@@ -768,9 +798,17 @@ class Viewer(QWidget):
             return
         if e.button() != Qt.LeftButton:
             return
+        q = w.quad_now()
+        if q is not None:
+            for k, (qx, qy) in enumerate(q):
+                sp = self.to_screen(qx, qy)
+                if math.hypot(sp.x() - pos.x(), sp.y() - pos.y()) < 12:
+                    w._drag_quad = k
+                    return
         x, y = self.to_src(pos)
         if tool == "point":
-            w.add_points(np.array([[x, y]], np.float32), new_group=False)
+            xy = w.unview_xy(w.cur, np.array([[x, y]], float)).astype(np.float32)
+            w.add_points(xy, new_group=False)
         elif tool == "lasso":
             self.drag_poly = [QPointF(x, y)]
         elif tool in ("rect", "select"):
@@ -781,6 +819,9 @@ class Viewer(QWidget):
 
     def mouseMoveEvent(self, e):
         pos = e.position()
+        if self.win._drag_quad >= 0:
+            self.win.set_quad_corner(self.win._drag_quad, self.to_src(pos))
+            return
         if self.pan_start is not None:
             p0, off0 = self.pan_start
             self.off = off0 + (pos - p0)
@@ -802,6 +843,9 @@ class Viewer(QWidget):
             self.update()
 
     def mouseReleaseEvent(self, e):
+        if self.win._drag_quad >= 0:
+            self.win._drag_quad = -1
+            return
         if self.pan_start is not None:
             self.pan_start = None
             return
@@ -809,7 +853,7 @@ class Viewer(QWidget):
             poly = [(q.x(), q.y()) for q in self.drag_poly]
             self.drag_poly = []
             if len(poly) >= 3:
-                self.win.fill_zone(np.array(poly, np.float32))
+                self.win.fill_zone(self.win.unview_xy(self.win.cur, np.array(poly, float)).astype(np.float32))
             self.update()
         elif self.drag_rect_start is not None:
             a, b = self.drag_rect_start, self._rect_end
@@ -822,9 +866,8 @@ class Viewer(QWidget):
                 else:
                     self.win.select_point(self._nearest(self.to_screen(a.x(), a.y())), self._shift)
             elif big:
-                poly = np.array([[a.x(), a.y()], [b.x(), a.y()], [b.x(), b.y()], [a.x(), b.y()]],
-                                np.float32)
-                self.win.fill_zone(poly)
+                poly = np.array([[a.x(), a.y()], [b.x(), a.y()], [b.x(), b.y()], [a.x(), b.y()]], float)
+                self.win.fill_zone(self.win.unview_xy(self.win.cur, poly).astype(np.float32))
             self.update()
 
     def _nearest(self, pos: QPointF) -> int:
@@ -897,6 +940,14 @@ class StudioWindow(QMainWindow):
         self._gcache: dict = {}
         self.undo: List[int] = []
         self.default_style = load_default_style()
+        self.solve = None            # solveur de mouvement (onglet ③)
+        self.C = None                # correction de stabilisation par image
+        self.zoom = 1.0
+        self.quad_ref = None         # 4 coins (insertion planaire) sur l'image de référence
+        self._drag_quad = -1
+        self.solve_timer = QTimer(self)
+        self.solve_timer.setSingleShot(True)
+        self.solve_timer.timeout.connect(self._recompute_solve)
         self.play_timer = QTimer(self)
         self.play_timer.timeout.connect(self._play_tick)
         self.render_timer = QTimer(self)
@@ -983,10 +1034,12 @@ class StudioWindow(QMainWindow):
         root.addWidget(left, 1)
 
         self.tabs = QTabWidget()
-        self.tabs.setFixedWidth(410)
-        self.tabs.addTab(self._scroll(self._tab_tracking()), "① Points et suivi")
+        self.tabs.setFixedWidth(430)
+        self.tabs.addTab(self._scroll(self._tab_tracking()), "① Suivi")
         self.tabs.addTab(self._scroll(self._tab_shapes()), "② Formes")
-        self.tabs.addTab(self._scroll(self._tab_export()), "③ Export")
+        self.tabs.addTab(self._scroll(self._tab_motion()), "③ Stabiliser")
+        self.tabs.addTab(self._scroll(self._tab_export()), "④ Export")
+        self.tabs.currentChanged.connect(lambda _: (self._update_image(), self._refresh_overlay()))
         root.addWidget(self.tabs)
         self.statusBar().showMessage("Ouvrez une vidéo pour commencer.")
 
@@ -1085,6 +1138,12 @@ class StudioWindow(QMainWindow):
         gl.addWidget(self.cb_verify)
         gl.addWidget(help_label("Chaque point est re-suivi à l'envers : s'il ne revient pas à "
                                 "son départ, il est coupé là où il a décroché (≈ ×2 temps)."))
+        self.cb_refine = QCheckBox("Précision sous-pixel (suivi hybride, recommandé)")
+        self.cb_refine.setChecked(True)
+        gl.addWidget(self.cb_refine)
+        gl.addWidget(help_label("TAPNext++ garde l'identité des points sur tout le plan ; un flux "
+                                "optique local en haute résolution apporte la précision sous-pixel "
+                                "indispensable à la stabilisation (≈ 7× moins de gigue)."))
         self.cb_fp16 = QCheckBox("Économie de VRAM (FP16)")
         gl.addWidget(self.cb_fp16)
         self.b_track = QPushButton("▶  Lancer le suivi")
@@ -1188,6 +1247,216 @@ class StudioWindow(QMainWindow):
         self._group_widgets_enabled(False)
         return panel
 
+    def _tab_motion(self) -> QWidget:
+        panel = QWidget()
+        pv = QVBoxLayout(panel)
+        pv.setContentsMargins(8, 4, 10, 10)
+        g = QGroupBox("Mouvement à calculer")
+        gl = QVBoxLayout(g)
+        gl.addWidget(help_label(
+            "Pour <b>stabiliser la caméra</b>, utilisez un groupe de points posé sur le "
+            "<b>décor</b> (pas sur les personnages). Pour <b>suivre un sujet</b> ou une surface, "
+            "utilisez son groupe. Les points aberrants sont rejetés automatiquement (RANSAC)."))
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Points utilisés"))
+        self.mo_group = QComboBox()
+        self.mo_group.currentIndexChanged.connect(self._schedule_solve)
+        row.addWidget(self.mo_group, 1)
+        gl.addLayout(row)
+        self.mo_model = QComboBox()
+        self.mo_model.addItems(["Position seule (translation)", "Position + rotation + échelle",
+                                "Perspective (surface plane)"])
+        self.mo_model.setCurrentIndex(1)
+        self.mo_model.currentIndexChanged.connect(self._schedule_solve)
+        gl.addWidget(self.mo_model)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Image de référence"))
+        self.mo_ref = QSpinBox()
+        self.mo_ref.setRange(0, 0)
+        self.mo_ref.valueChanged.connect(lambda _: (setattr(self, "_ref_user", True),
+                                                    self._schedule_solve()))
+        row.addWidget(self.mo_ref)
+        b = QPushButton("Image courante")
+        b.clicked.connect(lambda: self.mo_ref.setValue(self.cur))
+        row.addWidget(b)
+        gl.addLayout(row)
+        self.lbl_solve = help_label("Lancez le suivi pour calculer le mouvement.")
+        gl.addWidget(self.lbl_solve)
+        pv.addWidget(g)
+
+        g = QGroupBox("Stabilisation")
+        gl = QVBoxLayout(g)
+        self.st_smooth = ValueSlider("Lissage (0 = plan verrouillé)", 0, 120, 0, 1, "{:.0f}",
+                                     "0 : la caméra ne bouge plus du tout. Plus haut : seuls les "
+                                     "tremblements sont retirés, le mouvement voulu est conservé.")
+        self.st_smooth.changed.connect(self._schedule_solve)
+        gl.addWidget(self.st_smooth)
+        row = QHBoxLayout()
+        self.st_pos, self.st_rot, self.st_scale = (QCheckBox("Position"), QCheckBox("Rotation"),
+                                                   QCheckBox("Échelle"))
+        for c in (self.st_pos, self.st_rot, self.st_scale):
+            c.setChecked(True)
+            c.toggled.connect(self._schedule_solve)
+            row.addWidget(c)
+        gl.addLayout(row)
+        self.st_zoom = QCheckBox("Zoom automatique (aucun bord noir)")
+        self.st_zoom.setChecked(True)
+        self.st_zoom.toggled.connect(self._schedule_solve)
+        gl.addWidget(self.st_zoom)
+        self.st_preview = QCheckBox("Aperçu stabilisé dans la vue")
+        self.st_preview.toggled.connect(lambda _: (self._update_image(), self._refresh_overlay()))
+        gl.addWidget(self.st_preview)
+        pv.addWidget(g)
+
+        g = QGroupBox("Insertion planaire (4 coins)")
+        gl = QVBoxLayout(g)
+        gl.addWidget(help_label(
+            "Avec le modèle <b>Perspective</b>, 4 coins orange apparaissent dans la vue : "
+            "glissez-les sur la surface à remplacer (écran, panneau, mur…). Ils suivent la "
+            "surface sur tout le plan → nœud Fusion <i>CornerPositioner</i> (onglet ④)."))
+        b = QPushButton("Réinitialiser les coins")
+        b.clicked.connect(self._reset_quad)
+        gl.addWidget(b)
+        pv.addWidget(g)
+        pv.addStretch(1)
+        return panel
+
+    # ------------------------------------------------------------ solveur
+    def _schedule_solve(self, *_):
+        self.solve_timer.start(150)
+
+    def _solve_cols(self) -> Optional[np.ndarray]:
+        gid = self.mo_group.currentData() if hasattr(self, "mo_group") else None
+        if gid is None or gid < 0:
+            return np.arange(self.n_tracked)
+        return np.nonzero(self.pgroup[:self.n_tracked] == gid)[0]
+
+    def motion_model(self) -> str:
+        return ms.MODELS[self.mo_model.currentIndex()]
+
+    def _recompute_solve(self):
+        self.solve, self.C = None, None
+        if self.res is None or not self.n_tracked or self.tracked_seg is None:
+            self.lbl_solve.setText("Lancez le suivi pour calculer le mouvement.")
+            self._update_image()
+            return
+        cols = self._solve_cols()
+        a, b = self.tracked_seg
+        self.mo_ref.blockSignals(True)
+        self.mo_ref.setRange(a, b)
+        if not getattr(self, "_ref_user", False) and self.res.query_frames is not None:
+            # Par défaut : l'image où la plupart des points ont été posés.
+            vals, cnt = np.unique(self.res.query_frames, return_counts=True)
+            self.mo_ref.setValue(int(vals[np.argmax(cnt)]))
+        self.mo_ref.blockSignals(False)
+        if cols is None or len(cols) == 0:
+            self.lbl_solve.setText("Aucun point suivi dans ce groupe.")
+            self._update_image()
+            return
+        W, H = self.store.info.width, self.store.info.height
+        valid = se.valid_mask(self.res, np.arange(self.n_tracked)) & (self.res.visibility >= 0.5)
+        model = self.motion_model()
+        ref = self.mo_ref.value()
+        self.solve = ms.solve_motion(self.res.positions, valid, ref, a, b, model,
+                                     ransac_px=max(1.5, 0.0015 * max(W, H)), cols=cols)
+        st = ms.StabSettings(smooth=self.st_smooth.value(), position=self.st_pos.isChecked(),
+                             rotation=self.st_rot.isChecked(), scale=self.st_scale.isChecked(),
+                             zoom=self.st_zoom.isChecked())
+        self.C, self.zoom = ms.stabilize(self.solve, W, H, st)
+        if self.quad_ref is None:
+            self._reset_quad(redraw=False)
+        sol = self.solve
+        okm = sol.method[a:b + 1]
+        rms = sol.rms[a:b + 1][okm > 0]
+        n_direct = int((okm == 1).sum())
+        n_bad = int(((okm == 0) | (okm == 3)).sum())
+        self.lbl_solve.setText(
+            f"Erreur moyenne {np.nanmean(rms):.2f} px · calage direct sur {n_direct}/{len(okm)} images"
+            + (f" · {n_bad} image(s) sans solution" if n_bad else "")
+            + (f" · zoom ×{self.zoom:.3f}" if self.st_zoom.isChecked() else "")
+            + f"<br>{self._solve_frame_text(self.cur)}")
+        self._update_image()
+        self._refresh_overlay()
+        self.timeline.update()
+
+    def _solve_frame_text(self, t: int) -> str:
+        sol = self.solve
+        if sol is None or not (0 <= t < len(sol.H)) or not sol.ok(t):
+            return f"Image {t} : pas de solution"
+        how = {1: "calage direct", 2: "relais image par image", 3: "maintenu"}.get(int(sol.method[t]), "?")
+        return f"Image {t} : {sol.inliers[t]} points retenus · erreur {sol.rms[t]:.2f} px · {how}"
+
+    def _reset_quad(self, redraw=True):
+        if self.store is None:
+            return
+        W, H = self.store.info.width, self.store.info.height
+        q = np.array([[W * .3, H * .3], [W * .7, H * .3], [W * .7, H * .7], [W * .3, H * .7]], float)
+        if self.res is not None and self.n_tracked and self.solve is not None:
+            cols = self._solve_cols()
+            r = self.solve.ref
+            xy = self.res.positions[r, cols]
+            xy = xy[np.isfinite(xy[:, 0])]
+            if len(xy) >= 3:
+                x0, y0 = np.percentile(xy, 5, axis=0)
+                x1, y1 = np.percentile(xy, 95, axis=0)
+                q = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], float)
+        self.quad_ref = q
+        if redraw:
+            self.viewer.update()
+
+    def stab_preview(self) -> bool:
+        return (hasattr(self, "st_preview") and self.st_preview.isChecked() and self.C is not None
+                and 0 <= self.cur < len(self.C) and bool(np.isfinite(self.C[self.cur, 0, 0])))
+
+    def view_xy(self, t: int, xy: np.ndarray) -> np.ndarray:
+        """Coordonnées source → coordonnées affichées (aperçu stabilisé)."""
+        if self.stab_preview() and 0 <= t < len(self.C) and np.isfinite(self.C[t, 0, 0]):
+            return ms.apply_h(self.C[t], xy)
+        if self.stab_preview():
+            return np.full_like(np.asarray(xy, float), np.nan)
+        return np.asarray(xy, float)
+
+    def unview_xy(self, t: int, xy: np.ndarray) -> np.ndarray:
+        if self.stab_preview():
+            return ms.apply_h(np.linalg.inv(self.C[t]), xy)
+        return np.asarray(xy, float)
+
+    def quad_visible(self) -> bool:
+        return (self.tabs.currentIndex() == 2 and self.motion_model() == "perspective"
+                and self.solve is not None and self.quad_ref is not None and self.solve.ok(self.cur))
+
+    def quad_now(self) -> Optional[np.ndarray]:
+        if not self.quad_visible():
+            return None
+        return self.view_xy(self.cur, ms.apply_h(self.solve.H[self.cur], self.quad_ref))
+
+    def set_quad_corner(self, k: int, xy_view):
+        if not self.quad_visible():
+            return
+        p_src = self.unview_xy(self.cur, np.array([xy_view], float))
+        self.quad_ref[k] = ms.apply_h(np.linalg.inv(self.solve.H[self.cur]), p_src)[0]
+        self.viewer.update()
+
+    def fusion_jobs(self) -> list:
+        """(mode, type, matrices, coins, nom) des nœuds Fusion à exporter."""
+        jobs = []
+        if self.solve is None:
+            self._recompute_solve()
+        if self.solve is None:
+            return jobs
+        W, H = self.store.info.width, self.store.info.height
+        persp = self.solve.model == "perspective"
+        frame_quad = np.array([[0, 0], [W, 0], [W, H], [0, H]], float)
+        if self.cb_fx_stab.isChecked():
+            jobs.append(("stabilize", "corner" if persp else "transform", self.C,
+                         frame_quad if persp else None, "TAP_Stabilize"))
+        if self.cb_fx_mm.isChecked():
+            jobs.append(("matchmove", "corner" if persp else "transform", self.solve.H,
+                         frame_quad if persp else None, "TAP_MatchMove"))
+        if self.cb_fx_corner.isChecked() and persp and self.quad_ref is not None:
+            jobs.append(("cornerpin", "corner", self.solve.H, self.quad_ref.copy(), "TAP_CornerPin"))
+        return jobs
+
     def _tab_export(self) -> QWidget:
         panel = QWidget()
         pv = QVBoxLayout(panel)
@@ -1220,24 +1489,26 @@ class StudioWindow(QMainWindow):
         self.cb_data = QCheckBox("Trajectoires CSV + JSON")
         self.cb_data.setChecked(True)
         gl.addWidget(self.cb_data)
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Fusion"))
-        self.fusion_mode = QComboBox()
-        self.fusion_mode.addItems(["Aucun nœud", "Stabilisation", "Match-move", "Les deux"])
-        self.fusion_mode.setCurrentIndex(3)
-        row.addWidget(self.fusion_mode, 1)
-        gl.addLayout(row)
-        self.fusion_smooth = ValueSlider("Lissage de la stabilisation (0 = plan verrouillé)",
-                                         0, 100, 0, 1, "{:.0f}")
-        gl.addWidget(self.fusion_smooth)
+        gl.addWidget(QLabel("Nœuds Fusion (réglages dans l'onglet ③) :"))
+        self.cb_fx_stab = QCheckBox("Stabilisation")
+        self.cb_fx_stab.setChecked(True)
+        self.cb_fx_mm = QCheckBox("Match-move (accrocher un élément)")
+        self.cb_fx_mm.setChecked(True)
+        self.cb_fx_corner = QCheckBox("Insertion planaire 4 coins (modèle Perspective)")
+        for c in (self.cb_fx_stab, self.cb_fx_mm, self.cb_fx_corner):
+            gl.addWidget(c)
+        self.cb_wire = QCheckBox("Brancher la stabilisation dans la comp du clip")
+        self.cb_wire.setToolTip("L'image du clip est alors directement stabilisée dans Resolve.")
+        self.cb_wire.setVisible(bool(self.job))
+        gl.addWidget(self.cb_wire)
         self.cb_attach = QCheckBox("Attacher la matte au clip dans Resolve")
         self.cb_attach.setChecked(True)
         self.cb_attach.setVisible(bool(self.job))
         gl.addWidget(self.cb_attach)
         if self.job:
             gl.addWidget(help_label(
-                "Fusion : « Stabilisation » insère le nœud dans la chaîne du clip (l'image est "
-                "stabilisée). « Match-move » et « Les deux » ajoutent les nœuds sans les brancher."))
+                "Les nœuds Fusion sont ajoutés dans la comp du clip ; seule la stabilisation peut "
+                "être branchée directement (case ci-dessus)."))
         self.cb_preview = QCheckBox("Vidéo de contrôle (preview)")
         self.cb_preview.setChecked(True)
         gl.addWidget(self.cb_preview)
@@ -1293,7 +1564,7 @@ class StudioWindow(QMainWindow):
             cur = self.rd.smoothed[t, :self.n_tracked].astype(np.float64)
             if not self.res.tracked[t]:
                 cur[:] = np.nan
-            xy[:self.n_tracked] = cur
+            xy[:self.n_tracked] = self.view_xy(t, cur)
         return xy
 
     # --------------------------------------------------------- ouverture
@@ -1308,6 +1579,7 @@ class StudioWindow(QMainWindow):
                 self.open_video(p)
 
     def _reset_points(self):
+        self._ref_user = False
         self.pts = np.zeros((0, 2), np.float32)
         self.qf = np.zeros(0, int)
         self.pgroup = np.zeros(0, int)
@@ -1392,19 +1664,36 @@ class StudioWindow(QMainWindow):
         if f == self.cur and not force:
             return
         self.cur = f
-        img = self.store.frame(f)
-        if img is not None:
-            rgb = np.ascontiguousarray(img)
-            self._img_ref = rgb
-            self.viewer.qimg = QImage(rgb.data, rgb.shape[1], rgb.shape[0], rgb.strides[0],
-                                      QImage.Format_BGR888)
-        else:
-            self.viewer.qimg = None
+        self._update_image()
+        if self.solve is not None and hasattr(self, "lbl_solve"):
+            txt = self.lbl_solve.text().split("<br>")[0]
+            self.lbl_solve.setText(txt + "<br>" + self._solve_frame_text(f))
         self.frame_spin.blockSignals(True)
         self.frame_spin.setValue(f)
         self.frame_spin.blockSignals(False)
         self._refresh_overlay()
         self.timeline.update()
+
+    def _update_image(self):
+        """Image courante (stabilisée si l'aperçu est actif)."""
+        if not self.store:
+            return
+        img = self.store.frame(self.cur)
+        if img is None:
+            self.viewer.qimg = None
+            self.viewer.update()
+            return
+        if self.stab_preview():
+            s = self.store.scale
+            S = np.diag([s, s, 1.0])
+            Mv = S @ self.C[self.cur] @ np.linalg.inv(S)
+            img = cv2.warpPerspective(img, Mv, (img.shape[1], img.shape[0]),
+                                      flags=cv2.INTER_LINEAR, borderValue=(0, 0, 0))
+        rgb = np.ascontiguousarray(img)
+        self._img_ref = rgb
+        self.viewer.qimg = QImage(rgb.data, rgb.shape[1], rgb.shape[0], rgb.strides[0],
+                                  QImage.Format_BGR888)
+        self.viewer.update()
 
     def toggle_play(self):
         if not self.store:
@@ -1473,6 +1762,18 @@ class StudioWindow(QMainWindow):
             row_sel = len(self.groups) - 1
         self.group_list.setCurrentRow(row_sel)
         self.group_list.blockSignals(False)
+        if hasattr(self, "mo_group"):
+            cur_gid = self.mo_group.currentData()
+            self.mo_group.blockSignals(True)
+            self.mo_group.clear()
+            self.mo_group.addItem("Tous les points suivis", -1)
+            for i, g in enumerate(self.groups):
+                self.mo_group.addItem(f"{i + 1}. {g.name}", g.id)
+            j = self.mo_group.findData(cur_gid)
+            self.mo_group.setCurrentIndex(j if j >= 0 else 0)
+            self.mo_group.blockSignals(False)
+            if j < 0 and cur_gid not in (None, -1):
+                self._schedule_solve()
         self._on_group_row(row_sel)
 
     def _on_group_row(self, row: int):
@@ -1762,7 +2063,8 @@ class StudioWindow(QMainWindow):
         pts, qf = self.pts[first:], np.clip(self.qf[first:], *seg)
         res_px = 512 if self.quality.currentIndex() == 0 else 256
         self.tracker_thread = TrackThread(self.store, pts, qf, seg[0], seg[1], res_px,
-                                          self.cb_verify.isChecked(), self.cb_fp16.isChecked())
+                                          self.cb_verify.isChecked(), self.cb_fp16.isChecked(),
+                                          self.cb_refine.isChecked())
         self.tracker_thread.progress.connect(self._on_progress)
         self.tracker_thread.done.connect(lambda r: self._on_tracked(r, first, seg))
         self.tracker_thread.failed.connect(self._on_failed)
@@ -1819,6 +2121,9 @@ class StudioWindow(QMainWindow):
     # ------------------------------------------------------------ rendu
     def _tracking_changed(self):
         self.res_version += 1
+        self.quad_ref = None if self.res is None else self.quad_ref
+        if hasattr(self, "solve_timer"):
+            self._schedule_solve()
         self._gcache.clear()
         if self.res is None:
             self.rd = None
@@ -1851,7 +2156,8 @@ class StudioWindow(QMainWindow):
 
     def _refresh_overlay(self):
         v = self.viewer
-        if self.res is None or self.view_mode() == "points" or not self.store:
+        if (self.res is None or self.view_mode() == "points" or not self.store or self.stab_preview()
+                or self.tabs.currentIndex() == 2):
             v.overlay = None
             v.update()
             return
@@ -1960,16 +2266,14 @@ class StudioWindow(QMainWindow):
         keep = [i for i, L in enumerate(layers) if L[1] is not None]
         gindex = {g.id: k for k, g in enumerate(groups)}
         point_groups = np.array([gindex.get(int(v), 0) for v in self.pgroup[:self.n_tracked]], np.int32)
+        fusion_jobs = self.fusion_jobs()
         job = dict(
+            fusion_jobs=fusion_jobs, frames=list(range(self.seg_in, self.seg_out + 1)),
             info=info, res=self.res, rd=self.rd, pts=self.pts[:self.n_tracked],
             out_dir=out_dir, name=name,
             matte=self.cb_matte.isChecked() or bool(self.job),
             codec=["prores", "dnxhr", "h264", "png"][self.codec.currentIndex()],
             data=self.cb_data.isChecked(),
-            fusion="none" if self.job else
-            ["none", "stabilize", "matchmove", "both"][self.fusion_mode.currentIndex()],
-            fusion_to_resolve=["none", "stabilize", "matchmove", "both"][self.fusion_mode.currentIndex()],
-            fusion_smooth=int(self.fusion_smooth.value()),
             preview=self.cb_preview.isChecked(),
             layers=[layers[i] for i in keep], group_names=[groups[i].name for i in keep],
             per_group=self.cb_per_group.isChecked(), invert=self.cb_invert.isChecked(),
@@ -2010,13 +2314,12 @@ class StudioWindow(QMainWindow):
         self.lbl_exp.setText("Export terminé.")
         if self.job:
             base = os.path.join(job["out_dir"], job["name"])
-            mode = job["fusion_to_resolve"]
             done = dict(status="ok", matte=next((o for o in outputs if o.endswith(("_matte.mov", "_matte.mp4"))
                                                  or "_matte_png" in o), ""),
                         csv=base + "_tracks.csv", outputs=outputs,
                         query_frame=job["ref_frame"], job_id=str(self.job.get("job_id", "")),
-                        fusion_mode=mode,
-                        fusion_smooth=job["fusion_smooth"], attach=self.cb_attach.isChecked(),
+                        fusion_mode=",".join(m for m, *_ in job["fusion_jobs"]) or "none",
+                        wire_stabilize=self.cb_wire.isChecked(), attach=self.cb_attach.isChecked(),
                         tapfx=job.get("tapfx", ""),
                         **{f"setting_{k}": v for k, v in job.get("settings", {}).items()})
             with open(self.job["done"], "w", encoding="utf-8") as f:

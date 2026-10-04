@@ -353,8 +353,11 @@ function M.paste_into_comp(comp, setting_text, insert_before_output)
   local ok = comp:Paste(data)
   local msg = "Nœud ajouté dans la comp Fusion."
   if ok and insert_before_output then
-    local sel = comp:GetToolList(true, "Transform") or {}
-    local tool = sel[1]
+    local tool
+    for _, t in pairs(comp:GetToolList(true) or {}) do
+      local nm = t.Name or ""
+      if nm:find("^TAP_Stabilize") then tool = t end
+    end
     local mo = (comp:GetToolList(false, "MediaOut") or {})[1]
     if tool and mo then
       local src = mo.Input and mo.Input:GetConnectedOutput()
@@ -365,7 +368,7 @@ function M.paste_into_comp(comp, setting_text, insert_before_output)
         if mi then tool:ConnectInput("Input", mi) end
       end
       mo:ConnectInput("Input", tool)
-      msg = "Nœud de stabilisation inséré avant " .. (mo.Name or "MediaOut") .. "."
+      msg = "Stabilisation branchée avant " .. (mo.Name or "MediaOut") .. " : l'image est stabilisée."
     end
   end
   comp:EndUndo(true)
@@ -454,25 +457,27 @@ function M.import_results(resolve, root, job_text, done_text)
       "TAPNext → TAPNext Shapes (posé sur un nœud de la page Color ou sur le clip). " ..
       "Le fichier de suivi est rempli automatiquement ; réglez les formes dans l'Inspecteur."
   end
-  local mode = M.json_field(done_text, "fusion_mode") or "none"
-  if mode ~= "none" then
+  local labels = { stabilize = "TAP_Stabilize (stabilisation)", matchmove = "TAP_MatchMove (match-move)",
+    cornerpin = "TAP_CornerPin (insertion 4 coins)" }
+  local wanted = {}
+  for _, md in ipairs({ "stabilize", "matchmove", "cornerpin" }) do
+    local f = M.json_field(done_text, "setting_" .. md)
+    if f and f ~= "" then wanted[#wanted + 1] = { md, f } end
+  end
+  if #wanted > 0 then
     local comp, rstart = M.get_comp(ctx)
     if comp then
-      local modes = (mode == "both") and { "stabilize", "matchmove" } or { mode }
-      for _, md in ipairs(modes) do
-        local text = M.shift_setting(M.read_all(M.json_field(done_text, "setting_" .. md) or ""),
-          rstart)
+      local wire = M.json_field(done_text, "wire_stabilize") == "true"
+      for _, w in ipairs(wanted) do
+        local md, file = w[1], w[2]
+        local text = M.shift_setting(M.read_all(file), rstart)
         if text and text ~= "" then
-          -- Stabilisation seule : branchée avant MediaOut. « Les deux » : nœuds
-          -- ajoutés sans branchement, l'image du clip n'est pas modifiée.
-          local ok, msg = M.paste_into_comp(comp, text, mode == "stabilize")
-          if ok and mode ~= "stabilize" then
-            msg = "Nœud " .. (md == "stabilize" and "TAP_Stabilize" or "TAP_MatchMove") ..
-              " ajouté dans la comp Fusion (à brancher)."
-          end
-          report[#report + 1] = ok and ("✔ " .. msg) or "✘ Collage du nœud Fusion impossible."
+          local insert = (md == "stabilize") and wire
+          local ok, msg = M.paste_into_comp(comp, text, insert)
+          if ok and not insert then msg = "Nœud " .. labels[md] .. " ajouté (à brancher)." end
+          report[#report + 1] = ok and ("✔ " .. msg) or ("✘ Collage impossible : " .. labels[md])
         else
-          report[#report + 1] = "✘ Nœud Fusion « " .. md .. " » absent de l'export."
+          report[#report + 1] = "✘ Nœud " .. labels[md] .. " illisible."
         end
       end
       report[#report + 1] = "→ Page Fusion : la comp du clip contient les nœuds TAP_…"

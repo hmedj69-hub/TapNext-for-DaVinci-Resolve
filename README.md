@@ -5,6 +5,8 @@ Tracking de points avec **TAPNext++** de Google DeepMind ([`google-deepmind/tapn
 ```
 tap_studio.py         ← TAPNext Studio : application visuelle (recommandé)
 shape_engine.py       ← rendu des groupes de formes (mattes)
+track_refine.py       ← affinage sous-pixel hybride (TAPNext++ + flux optique)
+motion_solver.py      ← solveur de mouvement, stabilisation, export Fusion
 ofx_plugin/           ← effet OFX « TAPNext Shapes » pour Resolve (C++, binaire Windows fourni)
 tap_resolve_tool.py   ← moteur (tracking, mattes, exports) + ligne de commande
 fusion_export.py      ← CSV → nœuds Fusion (sans dépendance ; fonctionne aussi DANS Resolve)
@@ -52,6 +54,43 @@ INSTALLER_Windows.bat, install.sh, TAPNext_Studio.bat/.sh, TAPNext_CLI.bat
 
 ---
 
+## 🎯 Stabilisation et tracking (onglet ③ de Studio)
+
+### Comment ça marche
+| Étape | Technique | Pourquoi |
+|---|---|---|
+| Suivi long terme | **TAPNext++** | Suit les points sur des centaines d'images, gère les occultations et **retrouve** les points qui réapparaissent. Aucun décrochage définitif. |
+| Précision | **Affinage hybride** : flux optique Lucas-Kanade local sur l'image haute résolution, fusionné avec TAPNext++ par un filtre complémentaire | TAPNext++ prédit dans une grille de 256 px (±4 px en 1080p). Le flux optique apporte le sous-pixel, et TAPNext++ empêche toute dérive. |
+| Mouvement | **Solveur RANSAC** : translation, position + rotation + échelle, ou **perspective** (surface plane) | Les points qui bougent autrement (personnages, reflets) sont rejetés. Le calage se fait directement sur l'image de référence, avec relais d'image en image quand les points de référence sortent du champ. |
+| Stabilisation | Verrouillée ou lissée, composantes activables, **zoom automatique** | Même logique que le stabilisateur de Resolve ou le Warp Stabilizer. |
+
+Mesuré sur une vidéo de test au mouvement connu (rotation + translation) :
+
+| | TAPNext++ seul | Hybride |
+|---|---|---|
+| Erreur sur le mouvement de caméra | 1,03 px | **0,33 px** |
+| Tremblement après stabilisation | 0,91 px/image | **0,05 px/image** |
+| Plan en perspective avec 30 % de points aberrants (modèle Perspective) | — | **0,19 px** |
+
+### Utilisation
+1. **① Suivi** : posez une zone de points sur le **décor** pour stabiliser la caméra, ou sur le **sujet ou la surface** à suivre. Laissez « Précision sous-pixel » coché, puis lancez le suivi.
+2. **③ Stabiliser** :
+   - **Points utilisés** : le groupe qui sert au calcul (par exemple « 1. Zone 1 » pour le décor).
+   - **Modèle** : *Position seule*, *Position + rotation + échelle* (caméra à l'épaule, la plupart des cas) ou *Perspective* (surface plane : écran, mur, sol, panneau).
+   - **Image de référence** : l'image que la stabilisation verrouille.
+   - **Lissage** : 0 = plan verrouillé. Une valeur de 10 à 40 garde le mouvement voulu et retire les tremblements.
+   - **Position / Rotation / Échelle** : ce qui est corrigé.
+   - **Zoom automatique** : agrandit juste assez pour qu'aucun bord noir n'apparaisse.
+   - **Aperçu stabilisé** : la vue montre directement le résultat. Les points doivent rester immobiles.
+   - La **frise de temps** colore chaque image selon la qualité du calcul : vert < 0,7 px, jaune < 2 px, rouge au-delà.
+3. **Insertion planaire** (modèle Perspective) : glissez les **4 coins orange** sur la surface à remplacer. Ils suivent la surface sur tout le plan.
+4. **④ Export → Nœuds Fusion** :
+   - **Stabilisation** : nœud `Transform`, ou `CornerPositioner` en perspective. Depuis Resolve, il peut être **branché directement** dans la comp du clip.
+   - **Match-move** : accroche un élément (texte, logo) au mouvement.
+   - **Insertion planaire** : un `CornerPositioner` sur les 4 coins. Branchez votre image d'insertion dessus, puis fusionnez-la sur le plan.
+
+---
+
 ## ✨ Effet OFX « TAPNext Shapes » (dans Resolve)
 
 L'installateur ajoute un **vrai effet OpenFX** dans DaVinci Resolve. Toutes les formes se règlent **dans l'Inspecteur de Resolve**, en direct, et l'alpha sort directement sur le nœud de la page Color.
@@ -86,7 +125,7 @@ Installation : `INSTALLER_Windows.bat` copie l'effet dans `C:\Program Files\Comm
 
 ## 🖥️ TAPNext Studio, pas à pas
 
-Le panneau de droite a trois onglets : **① Points et suivi**, **② Formes** et **③ Export**.
+Le panneau de droite a quatre onglets : **① Suivi**, **② Formes**, **③ Stabiliser** et **④ Export**.
 
 | Étape | Ce que vous faites | Ce qui se passe |
 |---|---|---|

@@ -1124,6 +1124,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     g.add_argument("--points-per-batch", type=int, default=d["points_per_batch"])
     g.add_argument("--frames-per-step", type=int, default=None,
                    help="Images envoyées ensemble au modèle (défaut : 8 sur GPU)")
+    g.add_argument("--no-refine", action="store_true",
+                   help="Désactive l'affinage sous-pixel (suivi hybride TAPNext++ + flux optique)")
     g.add_argument("--verify", action="store_true",
                    help="Contrôle aller-retour : coupe les pistes qui décrochent (×2 temps)")
     g.add_argument("--use-certainty", action="store_true", default=d["use_certainty"],
@@ -1256,6 +1258,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                        args.backward, args.verify)
     del tracker
     _free_gpu()
+    if not args.no_refine:
+        import track_refine
+        last = args.end_frame if args.end_frame >= 0 else len(res.tracked) - 1
+        st = track_refine.refine_tracks(info.path, res, 0 if args.backward else args.start_frame,
+                                        last, info.width, info.height, query_xy=queries)
+        log.info("Affinage sous-pixel : %d mesures, %d recalages.", st["lk"], st["resets"])
     log.info("Tracking terminé : %d images suivies sur %d", int(res.tracked.sum()),
              len(res.tracked))
 

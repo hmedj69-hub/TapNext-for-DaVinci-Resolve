@@ -4,6 +4,7 @@ Tracking de points avec **TAPNext++** de Google DeepMind ([`google-deepmind/tapn
 
 ```
 tap_studio.py         ← TAPNext Studio : application visuelle (recommandé)
+shape_engine.py       ← rendu des groupes de formes (mattes)
 tap_resolve_tool.py   ← moteur (tracking, mattes, exports) + ligne de commande
 fusion_export.py      ← CSV → nœuds Fusion (sans dépendance ; fonctionne aussi DANS Resolve)
 resolve_plugin/       ← script Resolve « Workspace → Scripts → TAPNext_Tracker »
@@ -52,8 +53,47 @@ INSTALLER_Windows.bat, install.sh, TAPNext_Studio.bat/.sh, TAPNext_CLI.bat
 
 ## 🖥️ TAPNext Studio, pas à pas
 
+Le panneau de droite a trois onglets : **① Points et suivi**, **② Formes** et **③ Export**.
+
 | Étape | Ce que vous faites | Ce qui se passe |
 |---|---|---|
+| **Placer les points** (①) | Sur une image où le sujet est bien visible, **entourez-le** avec l'outil **Zone** (Z) ou **Rectangle** (R). | La zone se remplit de points (500 par défaut) placés sur les **détails texturés**, ceux que TAPNext++ suit le mieux. **Chaque zone devient un groupe de formes.** L'outil **Point** (A) ajoute un point au groupe sélectionné. **Clic droit** supprime un point. |
+| **Suivre** (①) | Réglez Début/Fin (**I**/**O**), puis **Lancer le suivi**. | Suivi **vers l'avant et vers l'arrière**, avec **contrôle aller-retour** : les points qui décrochent sont coupés à l'image exacte du décrochage. Si vous ajoutez des points ensuite, seuls les nouveaux sont suivis. |
+| **Formes** (②) | Choisissez un groupe dans la liste et réglez son style. Utilisez un **préréglage** pour démarrer vite. | Le rendu est en direct dans la vue « Image + matte » ou « Matte seule ». Le suivi n'est jamais recalculé. |
+| **Éditer à part** (②) | Outil **Sélection** (S) : glissez sur des points (**Maj** pour ajouter), puis **Nouveau groupe avec la sélection**. | Ces points ont désormais leur propre style. Par exemple, des étoiles sur une partie du sujet et des blobs ailleurs. |
+| **Exporter** (③) | Choisissez dossier, format, et éventuellement « une matte par groupe », les nœuds Fusion et la vidéo de contrôle. | La matte est rendue en pleine résolution (1080p ou 4K), et les CSV, JSON et `.setting` sont écrits. |
+
+**Projet** : **Enregistrer le projet** (Ctrl+S) crée un fichier `.tapnext` qui contient les points, le suivi et les formes. Pour le rouvrir : **Ouvrir…**, ou glissez le fichier sur la fenêtre. Rien n'est à recalculer.
+
+### Réglages d'un groupe de formes
+
+| Section | Réglage | Effet |
+|---|---|---|
+| Forme | Forme | Cercle, carré, carré arrondi, losange, triangle, hexagone, étoile, croix, anneau, ou **votre image PNG** (sa transparence sert de forme). |
+| | Révéler / Découper | **Révéler** : la forme est blanche dans la matte. **Découper** : la forme perce un trou dans les autres groupes, ou dans une matte blanche s'il n'y a aucun groupe « Révéler ». |
+| | Taille, Opacité, Rotation | Taille en pixels de la vidéo source. |
+| | Orienter dans le sens du mouvement | La forme tourne pour suivre la direction du point. |
+| | Variation aléatoire de taille | Chaque point reçoit une taille légèrement différente, pour un rendu organique. |
+| Réaction au mouvement | Grossir avec la vitesse | La forme grossit quand le point va vite. |
+| | Étirer dans la direction | La forme s'allonge dans le sens du mouvement. |
+| | Agrandissement maximal | Limite des deux effets précédents. |
+| Apparition | **Toujours visible** | La forme reste affichée même quand le point est caché : le masque est toujours actif. |
+| | Fondu d'apparition / de disparition | Case à cocher et durée en images. Décochées, la forme apparaît ou disparaît d'un coup. |
+| Fusion et bords | Fusion des formes | 0 = formes nettes et séparées. Au-dessus, les formes proches se rejoignent (effet « metaball »). |
+| | Seuil, Douceur du bord | Taille de la fusion et adoucissement du contour. |
+| Effets | Traînée dans la matte | La forme laisse une traînée qui s'estompe sur N images. |
+| | Lissage des trajectoires | Supprime les micro-tremblements. |
+
+Les **valeurs par défaut** reprennent vos réglages : taille 4 px, fusion 0,10, seuil 0,10, douceur 0, grossir 0,1, étirer 0,195, fondus désactivés, lissage 2,1 et matte finale inversée. Le bouton **Style par défaut** enregistre le style courant pour les prochains groupes.
+
+Raccourcis : **Espace** lecture · **←/→** image · **I/O** début/fin · **F** cadrer · **Z** zone · **R** rectangle · **A** point · **S** sélection · **Échap** désélectionner · **Suppr** supprimer · **Ctrl+A** tout sélectionner · **Ctrl+Z** annuler · **Ctrl+O** ouvrir · **Ctrl+S** enregistrer.
+
+Conseils pour un suivi de qualité :
+- Posez les points sur une image **nette**, où le sujet est bien visible. Si le sujet change beaucoup d'aspect au cours du plan, ajoutez une seconde zone sur une autre image.
+- Gardez **Précision maximale (512 px)** et le **contrôle aller-retour**.
+- Entourez **le sujet seul** : des points posés sur le fond suivent le fond.
+
+---|---|---|
 | **① Placer les points** | Allez sur une image où le sujet est bien visible et **entourez-le** avec l'outil **Zone (lasso)** ou **Zone (rectangle)**. | La zone se remplit automatiquement de points (80 par défaut) placés sur les **détails texturés**, ceux que TAPNext++ suit le mieux, en évitant les aplats. L'outil **Point** pose un point précis. **Clic droit** supprime un point, **Ctrl+Z** annule. Vous pouvez poser des points sur plusieurs images différentes. |
 | **② Suivre** | Réglez Début/Fin (touches **I**/**O**), puis cliquez sur **Lancer le suivi**. | Chaque point est suivi **vers l'avant et vers l'arrière** depuis l'image où il a été posé. Le **contrôle aller-retour** re-suit chaque piste à l'envers : si elle ne revient pas à son point de départ, elle est **coupée à l'image exacte où elle a décroché**. Les masques ne « glissent » donc plus sur le décor. Si vous ajoutez des points ensuite, seuls les nouveaux sont suivis. |
 | **③ Vérifier** | **Espace** pour lire, **←/→** image par image, molette pour zoomer, clic milieu pour se déplacer. | Les points s'affichent avec leurs **traînées**. Un point creux et gris est occulté. Un point qui a mal suivi se supprime d'un clic droit, sans relancer le suivi. |

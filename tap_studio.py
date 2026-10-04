@@ -6,23 +6,24 @@ TAPNext Studio — interface visuelle de tracking TAPNext++ pour DaVinci Resolve
   • Visionneuse vidéo (zoom molette, déplacement clic-milieu, timeline, lecture).
   • Placement des points : dessinez une zone autour du sujet (elle se remplit de
     points sur les détails texturés) ou cliquez des points précis, sur
-    n'importe quelle image du plan.
+    n'importe quelle image du plan. Chaque zone devient un groupe de formes.
   • Suivi TAPNext++ bidirectionnel avec contrôle aller-retour, en arrière-plan.
-  • Trajectoires et matte affichées en direct ; les réglages de matte se
-    voient immédiatement, sans relancer le suivi.
-  • Export : matte N&B (ProRes/DNxHR/H.264/PNG), CSV/JSON, nœuds Fusion.
-  • Lancé depuis Resolve (Workspace > Scripts > TAPNext_Tracker), les
-    résultats repartent automatiquement dans Resolve.
+  • Groupes de formes : forme (cercle, étoile, image PNG…), révéler/découper,
+    taille, rotation, réaction au mouvement, fondus activables, toujours
+    visible, fusion, traînée — rendu en direct, sans relancer le suivi.
+  • Projets .tapnext (points, suivi et formes enregistrés).
+  • Export : matte N&B (ProRes/DNxHR/H.264/PNG), une matte par groupe, CSV/JSON,
+    nœuds Fusion. Depuis Resolve, les résultats y repartent automatiquement.
 
-Raccourcis : Espace lecture · ←/→ image · I/O début/fin · F cadrer ·
-A outil points · Z outil zone · R outil rectangle · Ctrl+Z annuler · Suppr effacer.
+Raccourcis : Espace lecture · ←/→ image · I/O début/fin · F cadrer · Z zone ·
+R rectangle · A point · S sélection · Échap désélectionner · Suppr supprimer ·
+Ctrl+A tout sélectionner · Ctrl+Z annuler · Ctrl+O ouvrir · Ctrl+S enregistrer.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import sys
 import threading
@@ -34,17 +35,18 @@ from typing import List, Optional
 import cv2
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import (QAction, QBrush, QColor, QFont, QImage, QKeySequence, QPainter,
-                           QPainterPath, QPalette, QPen, QPolygonF)
+from PySide6.QtGui import (QAction, QBrush, QColor, QFont, QIcon, QImage, QKeySequence,
+                           QPainter, QPainterPath, QPalette, QPen, QPixmap, QPolygonF)
 from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox, QFileDialog,
-                               QGridLayout, QGroupBox, QHBoxLayout, QLabel,
-                               QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton,
-                               QScrollArea, QSizePolicy, QSlider, QSpinBox, QToolButton,
-                               QVBoxLayout, QWidget)
+                               QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+                               QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
+                               QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSlider,
+                               QSpinBox, QTabWidget, QToolButton, QVBoxLayout, QWidget)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import fusion_export as fx  # noqa: E402
+import shape_engine as se  # noqa: E402
 import tap_resolve_tool as eng  # noqa: E402
 
 APP_NAME = "TAPNext Studio"
@@ -80,11 +82,14 @@ QProgressBar::chunk {{ background: {ACCENT}; border-radius: 2px; }}
 QScrollArea {{ border: none; }}
 QCheckBox::indicator {{ width: 14px; height: 14px; }}
 QStatusBar {{ background: #141518; color: #9a9ba3; }}
+QTabWidget::pane {{ border: none; }}
+QTabBar::tab {{ background: #26272c; color: #b8b9c0; padding: 7px 12px; border: none;
+                border-top-left-radius: 4px; border-top-right-radius: 4px; margin-right: 2px; }}
+QTabBar::tab:selected {{ background: #2f3037; color: {ACCENT}; font-weight: bold; }}
+QListWidget {{ background: #15161a; border: 1px solid #34353c; border-radius: 3px; }}
+QListWidget::item {{ padding: 4px; }}
+QListWidget::item:selected {{ background: #3a3b43; color: #ffffff; }}
 """
-
-
-def point_color(i: int, n: int) -> QColor:
-    return QColor.fromHsvF(((i * 0.61803398875) % 1.0), 0.75, 1.0)
 
 
 # =============================================================================
@@ -217,55 +222,6 @@ class TrackThread(QThread):
             self.failed.emit(f"{type(e).__name__} : {e}")
 
 
-class ExportThread(QThread):
-    progress = Signal(str, float)
-    done = Signal(list)
-    failed = Signal(str)
-
-    def __init__(self, job: dict):
-        super().__init__()
-        self.job = job
-        self.cancel = threading.Event()
-
-    def run(self):
-        j = self.job
-        try:
-            info, res, rd = j["info"], j["res"], j["rd"]
-            os.makedirs(j["out_dir"], exist_ok=True)
-            base = os.path.join(j["out_dir"], j["name"])
-            outputs = []
-            csv_path = base + "_tracks.csv"
-            if j["data"] or j["fusion"] != "none" or j.get("job_mode"):
-                self.progress.emit("Export des trajectoires", 0)
-                eng.export_csv(csv_path, rd.smoothed, res.visibility, rd.velocity, res.tracked)
-                params = dict(j["params"], query_frames=[int(v) for v in res.query_frames])
-                eng.export_json(base + "_tracks.json", info, j["pts"], params, len(res.tracked))
-                outputs += [csv_path, base + "_tracks.json"]
-            if j["fusion"] != "none":
-                modes = ["stabilize", "matchmove"] if j["fusion"] == "both" else [j["fusion"]]
-                for mode in modes:
-                    p = f"{base}_fusion_{mode}.setting"
-                    fx.export_setting(csv_path, p, info.width, info.height, mode=mode,
-                                      min_visibility=0.5, ref_frame=j["ref_frame"],
-                                      smooth_radius=j["fusion_smooth"],
-                                      outlier_px=max(2.0, 0.002 * info.width))
-                    outputs.append(p)
-            if j["matte"]:
-                outputs += eng.write_matte_video(base, info, j["codec"], j["mparams"], rd,
-                                                 j["preview"], progress=self.progress.emit,
-                                                 cancel=self.cancel)
-            self.done.emit(outputs)
-        except eng.Cancelled:
-            self.failed.emit("Export annulé.")
-        except Exception as e:
-            traceback.print_exc()
-            self.failed.emit(f"{type(e).__name__} : {e}")
-
-
-# =============================================================================
-# Widgets
-# =============================================================================
-
 class ValueSlider(QWidget):
     """Curseur flottant avec libellé et valeur affichée."""
     changed = Signal(float)
@@ -370,6 +326,236 @@ class Timeline(QWidget):
             self.seek.emit(self._f(e.position().x()))
 
 
+class ExportThread(QThread):
+    progress = Signal(str, float)
+    done = Signal(list)
+    failed = Signal(str)
+
+    def __init__(self, job: dict):
+        super().__init__()
+        self.job = job
+        self.cancel = threading.Event()
+
+    def run(self):
+        j = self.job
+        try:
+            info, res, rd = j["info"], j["res"], j["rd"]
+            os.makedirs(j["out_dir"], exist_ok=True)
+            base = os.path.join(j["out_dir"], j["name"])
+            outputs = []
+            csv_path = base + "_tracks.csv"
+            if j["data"] or j["fusion"] != "none" or j.get("job_mode"):
+                self.progress.emit("Export des trajectoires", 0)
+                eng.export_csv(csv_path, rd.smoothed, res.visibility, rd.velocity, res.tracked)
+                params = dict(j["params"], query_frames=[int(v) for v in res.query_frames])
+                eng.export_json(base + "_tracks.json", info, j["pts"], params, len(res.tracked))
+                outputs += [csv_path, base + "_tracks.json"]
+            if j["fusion"] != "none":
+                modes = ["stabilize", "matchmove"] if j["fusion"] == "both" else [j["fusion"]]
+                for mode in modes:
+                    p = f"{base}_fusion_{mode}.setting"
+                    fx.export_setting(csv_path, p, info.width, info.height, mode=mode,
+                                      min_visibility=0.5, ref_frame=j["ref_frame"],
+                                      smooth_radius=j["fusion_smooth"],
+                                      outlier_px=max(2.0, 0.002 * info.width))
+                    outputs.append(p)
+            if j["matte"]:
+                outputs += se.write_shapes_video(
+                    base, info, j["codec"], j["layers"], j["invert"], j["preview"],
+                    j["group_names"] if j["per_group"] else None,
+                    progress=self.progress.emit, cancel=self.cancel)
+            self.done.emit(outputs)
+        except eng.Cancelled:
+            self.failed.emit("Export annulé.")
+        except Exception as e:
+            traceback.print_exc()
+            self.failed.emit(f"{type(e).__name__} : {e}")
+
+
+# =============================================================================
+# Groupes de formes
+# =============================================================================
+
+GROUP_COLORS = ["#ff8a3d", "#4fc3f7", "#9ccc65", "#f06292", "#ffd54f", "#ba68c8",
+                "#4db6ac", "#e57373", "#90a4ae", "#aed581"]
+
+
+class ShapeGroup:
+    def __init__(self, gid: int, name: str, style: "se.ShapeStyle"):
+        self.id = gid
+        self.name = name
+        self.style = style
+        self.enabled = True
+        self.color = QColor(GROUP_COLORS[gid % len(GROUP_COLORS)])
+
+
+def np_to_qimage_gray(a: np.ndarray) -> QImage:
+    a = np.ascontiguousarray(a)
+    return QImage(a.data, a.shape[1], a.shape[0], a.strides[0], QImage.Format_Grayscale8).copy()
+
+
+def shape_qicon(shape: str) -> QIcon:
+    g = se.shape_icon(shape, 22)
+    rgba = np.zeros((22, 22, 4), np.uint8)
+    rgba[..., :3] = 235
+    rgba[..., 3] = g
+    img = QImage(rgba.data, 22, 22, 88, QImage.Format_RGBA8888).copy()
+    return QIcon(QPixmap.fromImage(img))
+
+
+def color_icon(c: QColor) -> QIcon:
+    pm = QPixmap(14, 14)
+    pm.fill(c)
+    return QIcon(pm)
+
+
+class StyleEditor(QWidget):
+    """Édite le ShapeStyle du groupe courant. Signal changed(nom du champ)."""
+    changed = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.st = se.ShapeStyle()
+        self._loading = False
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+
+        def section(title):
+            g = QGroupBox(title)
+            v = QVBoxLayout(g)
+            v.setSpacing(4)
+            lay.addWidget(g)
+            return v
+
+        v = section("Forme")
+        self.shape = QComboBox()
+        for sh in se.SHAPES:
+            self.shape.addItem(shape_qicon(sh), se.SHAPE_LABELS[sh], sh)
+        self.shape.currentIndexChanged.connect(self._on_shape)
+        v.addWidget(self.shape)
+        self.mode = QComboBox()
+        self.mode.addItems(["Révéler : forme blanche dans la matte",
+                            "Découper : trou dans la matte"])
+        self.mode.currentIndexChanged.connect(lambda i: self._set("mode", ["add", "subtract"][i]))
+        v.addWidget(self.mode)
+        self.size = self._slider(v, "size", "Taille (px)", 1, 400, 0.5, "{:.1f}",
+                                 "Rayon de chaque forme, en pixels de la vidéo source")
+        self.opacity = self._slider(v, "opacity", "Opacité", 0, 1, 0.01, "{:.2f}")
+        self.rotation = self._slider(v, "rotation", "Rotation (°)", -180, 180, 1, "{:.0f}")
+        self.follow = self._check(v, "follow_motion", "Orienter dans le sens du mouvement")
+        self.jitter = self._slider(v, "size_jitter", "Variation aléatoire de taille", 0, 1, 0.01, "{:.2f}")
+
+        v = section("Réaction au mouvement")
+        self.grow = self._slider(v, "grow", "Grossir avec la vitesse", 0, 1, 0.005, "{:.3f}")
+        self.stretch = self._slider(v, "stretch", "Étirer dans la direction", 0, 1, 0.005, "{:.3f}")
+        self.max_scale = self._slider(v, "max_scale", "Agrandissement maximal (×)", 1, 8, 0.1, "{:.1f}")
+
+        v = section("Apparition")
+        self.always = self._check(v, "always_visible",
+                                  "Toujours visible (ignorer les occultations)")
+        row = QHBoxLayout()
+        self.fin_on = QCheckBox("Fondu d'apparition")
+        self.fin_on.toggled.connect(lambda b: self._set("fade_in_on", b))
+        self.fin = QSpinBox()
+        self.fin.setRange(1, 120)
+        self.fin.setSuffix(" img")
+        self.fin.valueChanged.connect(lambda x: self._set("fade_in", int(x)))
+        row.addWidget(self.fin_on, 1)
+        row.addWidget(self.fin)
+        v.addLayout(row)
+        row = QHBoxLayout()
+        self.fout_on = QCheckBox("Fondu de disparition")
+        self.fout_on.toggled.connect(lambda b: self._set("fade_out_on", b))
+        self.fout = QSpinBox()
+        self.fout.setRange(1, 120)
+        self.fout.setSuffix(" img")
+        self.fout.valueChanged.connect(lambda x: self._set("fade_out", int(x)))
+        row.addWidget(self.fout_on, 1)
+        row.addWidget(self.fout)
+        v.addLayout(row)
+
+        v = section("Fusion et bords")
+        v.addWidget(help_label("Fusion à 0 = formes nettes et séparées. Au-dessus, les formes "
+                               "proches se rejoignent (effet « metaball »)."))
+        self.merge = self._slider(v, "merge", "Fusion des formes", 0, 2, 0.01, "{:.2f}")
+        self.thr = self._slider(v, "threshold", "Seuil de fusion", 0.05, 0.95, 0.01, "{:.2f}")
+        self.soft = self._slider(v, "softness", "Douceur du bord", 0, 0.5, 0.01, "{:.2f}")
+
+        v = section("Effets")
+        self.trail = self._slider(v, "trail", "Traînée dans la matte (images)", 0, 30, 1, "{:.0f}")
+        self.smooth = self._slider(v, "smooth", "Lissage des trajectoires", 0, 5, 0.1, "{:.1f}")
+        self.set_style(self.st)
+
+    # ------------------------------------------------------------ helpers
+    def _slider(self, v, key, label, lo, hi, step, fmt, tip=""):
+        s = ValueSlider(label, lo, hi, getattr(self.st, key), step, fmt, tip)
+        s.changed.connect(lambda x, k=key: self._set(k, int(round(x)) if k == "trail" else x))
+        v.addWidget(s)
+        return s
+
+    def _check(self, v, key, label):
+        c = QCheckBox(label)
+        c.toggled.connect(lambda b, k=key: self._set(k, b))
+        v.addWidget(c)
+        return c
+
+    def _set(self, key, value):
+        if self._loading:
+            return
+        setattr(self.st, key, value)
+        self._sync_enabled()
+        self.changed.emit(key)
+
+    def _on_shape(self, i):
+        sh = self.shape.itemData(i)
+        if self._loading:
+            return
+        if sh == "image":
+            p, _ = QFileDialog.getOpenFileName(self, "Image de la forme (PNG avec transparence)",
+                                               self.st.image_path or "",
+                                               "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff)")
+            if not p:
+                self._loading = True
+                self.shape.setCurrentIndex(se.SHAPES.index(self.st.shape))
+                self._loading = False
+                return
+            self.st.image_path = p
+        self._set("shape", sh)
+
+    def _sync_enabled(self):
+        a = self.st.always_visible
+        for w in (self.fin_on, self.fout_on):
+            w.setEnabled(not a)
+        self.fin.setEnabled(not a and self.st.fade_in_on)
+        self.fout.setEnabled(not a and self.st.fade_out_on)
+        self.thr.setEnabled(self.st.merge > 0)
+
+    def set_style(self, st: "se.ShapeStyle"):
+        self.st = st
+        self._loading = True
+        self.shape.setCurrentIndex(se.SHAPES.index(st.shape) if st.shape in se.SHAPES else 0)
+        self.mode.setCurrentIndex(1 if st.mode == "subtract" else 0)
+        for w, k in ((self.size, "size"), (self.opacity, "opacity"), (self.rotation, "rotation"),
+                     (self.jitter, "size_jitter"), (self.grow, "grow"), (self.stretch, "stretch"),
+                     (self.max_scale, "max_scale"), (self.merge, "merge"), (self.thr, "threshold"),
+                     (self.soft, "softness"), (self.trail, "trail"), (self.smooth, "smooth")):
+            w.s.blockSignals(True)
+            w.set(getattr(st, k))
+            w.s.blockSignals(False)
+        self.follow.setChecked(st.follow_motion)
+        self.always.setChecked(st.always_visible)
+        self.fin_on.setChecked(st.fade_in_on)
+        self.fout_on.setChecked(st.fade_out_on)
+        self.fin.setValue(st.fade_in)
+        self.fout.setValue(st.fade_out)
+        self._loading = False
+        self._sync_enabled()
+
+
+# =============================================================================
+# Visionneuse
+# =============================================================================
+
 class Viewer(QWidget):
     """Affiche l'image courante + calques (points, trajectoires, matte, zones)."""
 
@@ -388,6 +574,7 @@ class Viewer(QWidget):
         self.drag_poly: List[QPointF] = []   # en coordonnées source
         self.drag_rect_start: Optional[QPointF] = None
         self._rect_end = QPointF(0, 0)
+        self._rect_tool = "rect"
         self.pan_start = None
         self.hover = -1
 
@@ -399,6 +586,7 @@ class Viewer(QWidget):
         W, H = st.info.width, st.info.height
         self.s = min(self.width() / W, self.height() / H) * 0.97
         self.off = QPointF((self.width() - W * self.s) / 2, (self.height() - H * self.s) / 2)
+        self.fit_pending = True
         self.update()
 
     def to_screen(self, x, y) -> QPointF:
@@ -428,20 +616,23 @@ class Viewer(QWidget):
         target = QRectF(self.off.x(), self.off.y(), info.width * self.s, info.height * self.s)
         p.setRenderHint(QPainter.SmoothPixmapTransform)
         mode = w.view_mode()
-        if self.qimg is not None and mode != "matte":
+        if mode == "matte":
+            p.fillRect(target, QColor("black"))
+        elif self.qimg is not None:
             p.drawImage(target, self.qimg)
-        elif mode != "matte":
+        else:
             p.setPen(QColor("#77787f"))
             p.drawText(target, Qt.AlignCenter, "Chargement…")
         if self.overlay is not None and mode in ("matte", "overlay"):
             p.drawImage(target, self.overlay)
         p.setRenderHint(QPainter.Antialiasing)
-        if mode != "matte":
+        if mode != "matte" or w.show_points_on_matte():
             self._draw_tracks(p)
         self._draw_zones(p)
         p.setPen(QColor(220, 220, 225, 200))
-        p.drawText(QRectF(10, 8, 400, 18), Qt.AlignLeft,
-                   f"Image {w.cur} / {w.n_frames() - 1}    {info.width}×{info.height}")
+        p.drawText(QRectF(10, 8, 600, 18), Qt.AlignLeft,
+                   f"Image {w.cur} / {w.n_frames() - 1}    {info.width}×{info.height}"
+                   + (f"    {int(w.sel.sum())} point(s) sélectionné(s)" if w.sel.any() else ""))
 
     def _draw_tracks(self, p: QPainter):
         w = self.win
@@ -453,6 +644,8 @@ class Viewer(QWidget):
         t = w.cur
         rd, res = w.rd, w.res
         nt = w.n_tracked
+        cols = w.point_colors()
+        sel = w.sel
         if rd is not None and nt and t < len(rd.smoothed):
             pos, alpha, vis = rd.smoothed, rd.alpha, rd.visible
             if trail > 0:
@@ -462,7 +655,6 @@ class Viewer(QWidget):
                         continue
                     seg = pos[t0:t + 1, i]
                     ok = vis[t0:t + 1, i] & np.isfinite(seg[:, 0])
-                    col = point_color(i, n)
                     path = QPainterPath()
                     started = False
                     for k in range(len(seg)):
@@ -475,30 +667,33 @@ class Viewer(QWidget):
                         else:
                             path.moveTo(sp)
                             started = True
-                    col.setAlphaF(0.55)
-                    p.setPen(QPen(col, max(1.0, size * 0.35)))
+                    col = QColor(cols[i])
+                    col.setAlphaF(0.5)
+                    p.setPen(QPen(col, max(1.0, size * 0.4)))
                     p.drawPath(path)
             for i in range(nt):
                 x, y = pos[t, i]
                 if not np.isfinite(x) or not res.tracked[t]:
                     continue
                 sp = self.to_screen(x, y)
-                col = point_color(i, n)
-                r = size * (1.5 if i == self.hover else 1.0)
+                r = size * (1.6 if i == self.hover else 1.0)
                 if vis[t, i]:
-                    p.setPen(QPen(QColor(0, 0, 0, 200), 1.2))
-                    p.setBrush(QBrush(col))
+                    p.setPen(QPen(QColor(0, 0, 0, 200), 1.0))
+                    p.setBrush(QBrush(cols[i]))
                     p.drawEllipse(sp, r, r)
                 elif alpha[t, i] > 0.02:
                     p.setBrush(Qt.NoBrush)
                     p.setPen(QPen(QColor(170, 170, 175, int(220 * alpha[t, i])), 1.2))
                     p.drawEllipse(sp, r * 0.8, r * 0.8)
+                if sel[i]:
+                    p.setBrush(Qt.NoBrush)
+                    p.setPen(QPen(QColor("white"), 1.5))
+                    p.drawEllipse(sp, r + 3, r + 3)
         # points pas encore suivis : visibles sur leur image de pose
         for i in range(nt, n):
             sp = self.to_screen(*w.pts[i])
-            on_frame = w.qf[i] == t
-            col = point_color(i, n) if on_frame else QColor(200, 200, 200, 90)
-            r = size + 2
+            col = QColor(cols[i]) if w.qf[i] == t else QColor(200, 200, 200, 90)
+            r = size + 3
             p.setBrush(Qt.NoBrush)
             p.setPen(QPen(QColor(0, 0, 0, 180), 3))
             p.drawLine(QPointF(sp.x() - r, sp.y()), QPointF(sp.x() + r, sp.y()))
@@ -506,10 +701,14 @@ class Viewer(QWidget):
             p.setPen(QPen(col, 1.5))
             p.drawLine(QPointF(sp.x() - r, sp.y()), QPointF(sp.x() + r, sp.y()))
             p.drawLine(QPointF(sp.x(), sp.y() - r), QPointF(sp.x(), sp.y() + r))
+            if sel[i]:
+                p.setPen(QPen(QColor("white"), 1.5))
+                p.drawEllipse(sp, r + 2, r + 2)
 
     def _draw_zones(self, p: QPainter):
-        pen = QPen(QColor(ACCENT), 1.6, Qt.DashLine)
-        p.setBrush(QColor(232, 131, 58, 30))
+        sel = self._rect_tool == "select"
+        pen = QPen(QColor("white" if sel else ACCENT), 1.4, Qt.DashLine)
+        p.setBrush(QColor(255, 255, 255, 18) if sel else QColor(232, 131, 58, 30))
         p.setPen(pen)
         if self.drag_poly:
             p.drawPolyline(QPolygonF([self.to_screen(q.x(), q.y()) for q in self.drag_poly]))
@@ -545,18 +744,20 @@ class Viewer(QWidget):
         if e.button() == Qt.RightButton:
             i = self._nearest(pos)
             if i >= 0:
-                w.delete_point(i)
+                w.delete_points(np.array([i]))
             return
         if e.button() != Qt.LeftButton:
             return
         x, y = self.to_src(pos)
         if tool == "point":
-            w.add_points(np.array([[x, y]], np.float32))
+            w.add_points(np.array([[x, y]], np.float32), new_group=False)
         elif tool == "lasso":
             self.drag_poly = [QPointF(x, y)]
-        elif tool == "rect":
+        elif tool in ("rect", "select"):
+            self._rect_tool = tool
             self.drag_rect_start = QPointF(x, y)
             self._rect_end = QPointF(x, y)
+            self._shift = bool(e.modifiers() & Qt.ShiftModifier)
 
     def mouseMoveEvent(self, e):
         pos = e.position()
@@ -593,7 +794,14 @@ class Viewer(QWidget):
         elif self.drag_rect_start is not None:
             a, b = self.drag_rect_start, self._rect_end
             self.drag_rect_start = None
-            if abs(a.x() - b.x()) > 4 and abs(a.y() - b.y()) > 4:
+            big = abs(a.x() - b.x()) * self.s > 4 and abs(a.y() - b.y()) * self.s > 4
+            if self._rect_tool == "select":
+                if big:
+                    self.win.select_rect(min(a.x(), b.x()), min(a.y(), b.y()),
+                                         max(a.x(), b.x()), max(a.y(), b.y()), self._shift)
+                else:
+                    self.win.select_point(self._nearest(self.to_screen(a.x(), a.y())), self._shift)
+            elif big:
                 poly = np.array([[a.x(), a.y()], [b.x(), a.y()], [b.x(), b.y()], [a.x(), b.y()]],
                                 np.float32)
                 self.win.fill_zone(poly)
@@ -601,16 +809,15 @@ class Viewer(QWidget):
 
     def _nearest(self, pos: QPointF) -> int:
         w = self.win
-        best, bd = -1, 14.0
-        for i in range(len(w.pts)):
-            xy = w.display_pos(i)
-            if xy is None:
-                continue
-            sp = self.to_screen(*xy)
-            d = math.hypot(sp.x() - pos.x(), sp.y() - pos.y())
-            if d < bd:
-                best, bd = i, d
-        return best
+        xy = w.display_positions()
+        if xy is None or not len(xy):
+            return -1
+        sx = self.off.x() + xy[:, 0] * self.s
+        sy = self.off.y() + xy[:, 1] * self.s
+        d = np.hypot(sx - pos.x(), sy - pos.y())
+        d[~np.isfinite(d)] = 1e9
+        i = int(np.argmin(d))
+        return i if d[i] < 14 else -1
 
     # ------------------------------------------------------- glisser-déposer
     def dragEnterEvent(self, e):
@@ -620,18 +827,33 @@ class Viewer(QWidget):
     def dropEvent(self, e):
         urls = e.mimeData().urls()
         if urls:
-            self.win.open_video(urls[0].toLocalFile())
+            p = urls[0].toLocalFile()
+            if p.lower().endswith(".tapnext"):
+                self.win.load_project(p)
+            else:
+                self.win.open_video(p)
 
 
 # =============================================================================
 # Fenêtre principale
 # =============================================================================
 
+SETTINGS_FILE = os.path.join(HERE, "studio_settings.json")
+
+
+def load_default_style() -> "se.ShapeStyle":
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as f:
+            return se.ShapeStyle.from_dict(json.load(f).get("default_style"))
+    except (OSError, ValueError):
+        return se.ShapeStyle()
+
+
 class StudioWindow(QMainWindow):
     def __init__(self, video: str = "", job: Optional[dict] = None):
         super().__init__()
         self.setWindowTitle(APP_NAME)
-        self.resize(1500, 900)
+        self.resize(1560, 940)
         self.job = job
         self.job_sent = False
         self.store: Optional[VideoStore] = None
@@ -640,22 +862,26 @@ class StudioWindow(QMainWindow):
         self.export_thread: Optional[ExportThread] = None
         self.cur = 0
         self.seg_in, self.seg_out = 0, 0
+        self._range_user = False
         self.pts = np.zeros((0, 2), np.float32)
         self.qf = np.zeros(0, int)
+        self.pgroup = np.zeros(0, int)
+        self.sel = np.zeros(0, bool)
+        self.groups: List[ShapeGroup] = []
+        self._next_gid = 0
         self.res = None
         self.rd = None
         self.n_tracked = 0
         self.tracked_seg = None
+        self.res_version = 0
+        self._gcache: dict = {}
         self.undo: List[int] = []
-        self.out_dir = ""
+        self.default_style = load_default_style()
         self.play_timer = QTimer(self)
         self.play_timer.timeout.connect(self._play_tick)
         self.render_timer = QTimer(self)
         self.render_timer.setSingleShot(True)
         self.render_timer.timeout.connect(self._refresh_overlay)
-        self.rd_timer = QTimer(self)
-        self.rd_timer.setSingleShot(True)
-        self.rd_timer.timeout.connect(self._recompute_rd)
         self._build()
         if video:
             QTimer.singleShot(50, lambda: self.open_video(video))
@@ -672,17 +898,23 @@ class StudioWindow(QMainWindow):
         lv = QVBoxLayout(left)
         lv.setContentsMargins(8, 8, 8, 8)
         top = QHBoxLayout()
-        b_open = QPushButton("Ouvrir une vidéo…")
+        b_open = QPushButton("Ouvrir…")
+        b_open.setToolTip("Ouvrir une vidéo ou un projet .tapnext (Ctrl+O)")
         b_open.clicked.connect(self._ask_open)
         top.addWidget(b_open)
+        b_save = QPushButton("Enregistrer le projet")
+        b_save.setToolTip("Sauvegarde points, suivi et formes (Ctrl+S) : rien à recalculer")
+        b_save.clicked.connect(self.save_project)
+        top.addWidget(b_save)
         top.addSpacing(12)
         self.tool_group = QButtonGroup(self)
         self.tool_btns = {}
         for key, text, tip in [
-            ("lasso", "◯  Zone (lasso)", "Entourez le sujet : la zone se remplit de points (Z)"),
-            ("rect", "▭  Zone (rectangle)", "Rectangle rempli de points (R)"),
-            ("point", "✚  Point", "Cliquez pour poser un point précis (A)"),
-            ("pan", "✋  Déplacer", "Déplacer la vue (ou clic milieu)"),
+            ("lasso", "◯  Zone", "Entourez le sujet : la zone se remplit de points (Z)"),
+            ("rect", "▭  Rectangle", "Rectangle rempli de points (R)"),
+            ("point", "✚  Point", "Ajoute un point précis au groupe sélectionné (A)"),
+            ("select", "⬚  Sélection", "Sélectionnez des points (glisser ; Maj = ajouter) (S)"),
+            ("pan", "✋", "Déplacer la vue (ou clic milieu)"),
         ]:
             b = QToolButton()
             b.setText(text)
@@ -695,6 +927,7 @@ class StudioWindow(QMainWindow):
         top.addStretch(1)
         self.view_combo = QComboBox()
         self.view_combo.addItems(["Image + points", "Image + matte", "Matte seule"])
+        self.view_combo.setCurrentIndex(1)
         self.view_combo.currentIndexChanged.connect(lambda _: self._refresh_overlay())
         top.addWidget(QLabel("Vue :"))
         top.addWidget(self.view_combo)
@@ -729,29 +962,61 @@ class StudioWindow(QMainWindow):
         lv.addLayout(trans)
         root.addWidget(left, 1)
 
-        # ---- panneau de droite
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setFixedWidth(400)
+        self.tabs = QTabWidget()
+        self.tabs.setFixedWidth(410)
+        self.tabs.addTab(self._scroll(self._tab_tracking()), "① Points et suivi")
+        self.tabs.addTab(self._scroll(self._tab_shapes()), "② Formes")
+        self.tabs.addTab(self._scroll(self._tab_export()), "③ Export")
+        root.addWidget(self.tabs)
+        self.statusBar().showMessage("Ouvrez une vidéo pour commencer.")
+
+        def sc(key, fn):
+            a = QAction(self)
+            a.setShortcut(QKeySequence(key))
+            a.setShortcutContext(Qt.ApplicationShortcut)
+            a.triggered.connect(fn)
+            self.addAction(a)
+        sc("Space", self.toggle_play)
+        sc("Left", lambda: self.set_frame(self.cur - 1))
+        sc("Right", lambda: self.set_frame(self.cur + 1))
+        sc("Home", lambda: self.set_frame(self.seg_in))
+        sc("End", lambda: self.set_frame(self.seg_out))
+        sc("I", lambda: self.in_spin.setValue(self.cur))
+        sc("O", lambda: self.out_spin.setValue(self.cur))
+        sc("F", lambda: self.viewer.fit())
+        sc("A", lambda: self.tool_btns["point"].setChecked(True))
+        sc("Z", lambda: self.tool_btns["lasso"].setChecked(True))
+        sc("R", lambda: self.tool_btns["rect"].setChecked(True))
+        sc("S", lambda: self.tool_btns["select"].setChecked(True))
+        sc("Esc", self.clear_selection)
+        sc("Delete", self.delete_selection)
+        sc("Ctrl+Z", self.undo_last)
+        sc("Ctrl+O", self._ask_open)
+        sc("Ctrl+S", self.save_project)
+        sc("Ctrl+A", self.select_all)
+
+    def _scroll(self, w: QWidget) -> QScrollArea:
+        s = QScrollArea()
+        s.setWidgetResizable(True)
+        s.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        s.setWidget(w)
+        return s
+
+    def _tab_tracking(self) -> QWidget:
         panel = QWidget()
         pv = QVBoxLayout(panel)
-        pv.setContentsMargins(10, 4, 12, 10)
-        scroll.setWidget(panel)
-        root.addWidget(scroll)
-
-        # ① Points
-        g = QGroupBox("① Placer les points")
+        pv.setContentsMargins(8, 4, 10, 10)
+        g = QGroupBox("Placer les points")
         gl = QVBoxLayout(g)
         gl.addWidget(help_label(
             "Allez sur une image où le sujet est bien visible, puis <b>entourez-le</b> avec "
-            "l'outil Zone : il se remplit de points sur les détails texturés (ce que TAPNext++ "
-            "suit le mieux). Outil Point pour un point précis. <b>Clic droit</b> = supprimer."))
+            "l'outil Zone : il se remplit de points sur les détails texturés. Chaque zone "
+            "devient un <b>groupe de formes</b> (onglet ②). <b>Clic droit</b> = supprimer un point."))
         row = QHBoxLayout()
         row.addWidget(QLabel("Points par zone"))
         self.n_per_zone = QSpinBox()
-        self.n_per_zone.setRange(1, 3000)
-        self.n_per_zone.setValue(80)
+        self.n_per_zone.setRange(1, 5000)
+        self.n_per_zone.setValue(500)
         row.addWidget(self.n_per_zone)
         gl.addLayout(row)
         self.seed_mode = QComboBox()
@@ -769,8 +1034,7 @@ class StudioWindow(QMainWindow):
         gl.addWidget(self.lbl_points)
         pv.addWidget(g)
 
-        # ② Suivi
-        g = QGroupBox("② Suivre")
+        g = QGroupBox("Suivre")
         gl = QVBoxLayout(g)
         row = QHBoxLayout()
         self.in_spin, self.out_spin = QSpinBox(), QSpinBox()
@@ -798,8 +1062,6 @@ class StudioWindow(QMainWindow):
         gl.addWidget(self.quality)
         self.cb_verify = QCheckBox("Contrôle aller-retour (recommandé)")
         self.cb_verify.setChecked(True)
-        self.cb_verify.setToolTip("Chaque piste est re-suivie en sens inverse ; si elle ne revient "
-                                  "pas à son point de départ, elle est coupée là où elle a décroché.")
         gl.addWidget(self.cb_verify)
         gl.addWidget(help_label("Chaque point est re-suivi à l'envers : s'il ne revient pas à "
                                 "son départ, il est coupé là où il a décroché (≈ ×2 temps)."))
@@ -820,50 +1082,97 @@ class StudioWindow(QMainWindow):
         gl.addWidget(self.lbl_prog)
         pv.addWidget(g)
 
-        # ③ Affichage
-        g = QGroupBox("③ Affichage")
+        g = QGroupBox("Affichage")
         gl = QVBoxLayout(g)
-        self.disp_size = ValueSlider("Taille des points", 2, 14, 5, 0.5, "{:.1f}")
+        self.disp_size = ValueSlider("Taille des points", 1, 14, 2, 0.5, "{:.1f}")
         self.disp_size.changed.connect(lambda _: self.viewer.update())
-        self.disp_trail = ValueSlider("Traînées (images)", 0, 60, 12, 1, "{:.0f}")
+        self.disp_trail = ValueSlider("Traînées affichées (images)", 0, 60, 35, 1, "{:.0f}")
         self.disp_trail.changed.connect(lambda _: self.viewer.update())
+        self.cb_points_on_matte = QCheckBox("Afficher les points sur la vue « Matte seule »")
+        self.cb_points_on_matte.toggled.connect(lambda _: self.viewer.update())
         gl.addWidget(self.disp_size)
         gl.addWidget(self.disp_trail)
+        gl.addWidget(self.cb_points_on_matte)
         pv.addWidget(g)
+        pv.addStretch(1)
+        return panel
 
-        # ④ Matte
-        g = QGroupBox("④ Matte (page Color)")
+    def _tab_shapes(self) -> QWidget:
+        panel = QWidget()
+        pv = QVBoxLayout(panel)
+        pv.setContentsMargins(8, 4, 10, 10)
+        g = QGroupBox("Groupes de formes")
         gl = QVBoxLayout(g)
-        gl.addWidget(help_label("Réglages visibles en direct (vue « Image + matte »), "
-                                "sans relancer le suivi."))
-        self.m_radius = ValueSlider("Rayon des blobs (px)", 4, 400, 40, 1, "{:.0f}",
-                                    "Rayon de chaque point, en pixels de la vidéo source")
-        self.m_merge = ValueSlider("Fusion des blobs", 0.1, 2.0, 0.6, 0.05, "{:.2f}",
-                                   "Flou de fusion (× rayon) : plus haut = masque plus continu")
-        self.m_thr = ValueSlider("Seuil", 0.1, 0.9, 0.5, 0.01, "{:.2f}",
-                                 "Plus bas = masque plus gros et plus lié")
-        self.m_soft = ValueSlider("Douceur du bord", 0.0, 0.3, 0.08, 0.01, "{:.2f}")
-        self.m_motion = QComboBox()
-        self.m_motion.addItems(["Mouvement : aucun effet", "Mouvement : agrandir",
-                                "Mouvement : étirer", "Mouvement : agrandir + étirer"])
-        self.m_sens = ValueSlider("Sensibilité au mouvement", 0.0, 0.5, 0.05, 0.005, "{:.3f}")
-        self.m_fin = ValueSlider("Fondu d'apparition (images)", 0, 60, 6, 1, "{:.0f}")
-        self.m_fout = ValueSlider("Fondu de disparition (images)", 0, 60, 8, 1, "{:.0f}")
-        self.m_smooth = ValueSlider("Lissage des trajectoires", 0.0, 5.0, 1.0, 0.1, "{:.1f}")
-        self.m_invert = QCheckBox("Inverser la matte")
-        for wdg in (self.m_radius, self.m_merge, self.m_thr, self.m_soft, self.m_motion,
-                    self.m_sens, self.m_fin, self.m_fout, self.m_smooth, self.m_invert):
-            gl.addWidget(wdg)
-        for wdg in (self.m_radius, self.m_merge, self.m_thr, self.m_soft, self.m_sens):
-            wdg.changed.connect(self._schedule_overlay)
-        self.m_motion.currentIndexChanged.connect(self._schedule_overlay)
-        self.m_invert.toggled.connect(self._schedule_overlay)
-        for wdg in (self.m_fin, self.m_fout, self.m_smooth):
-            wdg.changed.connect(lambda _: self.rd_timer.start(150))
+        gl.addWidget(help_label(
+            "Chaque groupe de points porte ses formes. Cochez/décochez pour l'activer, "
+            "double-cliquez pour le renommer. Avec l'outil <b>Sélection</b> (S), prenez des "
+            "points et créez-en un nouveau groupe pour les régler à part."))
+        self.group_list = QListWidget()
+        self.group_list.setMinimumHeight(110)
+        self.group_list.setMaximumHeight(170)
+        self.group_list.currentRowChanged.connect(self._on_group_row)
+        self.group_list.itemChanged.connect(self._on_group_item_changed)
+        gl.addWidget(self.group_list)
+        row = QHBoxLayout()
+        b = QPushButton("Sélectionner ses points")
+        b.clicked.connect(self.select_group_points)
+        row.addWidget(b)
+        b = QPushButton("Supprimer le groupe")
+        b.clicked.connect(self.delete_group)
+        row.addWidget(b)
+        gl.addLayout(row)
+        self.lbl_sel = QLabel("Aucun point sélectionné")
+        gl.addWidget(self.lbl_sel)
+        row = QHBoxLayout()
+        self.b_new_group = QPushButton("Nouveau groupe avec la sélection")
+        self.b_new_group.clicked.connect(self.group_from_selection)
+        row.addWidget(self.b_new_group)
+        self.b_del_sel = QPushButton("Supprimer")
+        self.b_del_sel.clicked.connect(self.delete_selection)
+        row.addWidget(self.b_del_sel)
+        gl.addLayout(row)
         pv.addWidget(g)
 
-        # ⑤ Export
-        g = QGroupBox("⑤ Exporter" + (" vers DaVinci Resolve" if self.job else ""))
+        g = QGroupBox("Style du groupe")
+        gl = QVBoxLayout(g)
+        row = QHBoxLayout()
+        self.preset = QComboBox()
+        self.preset.addItem("Préréglage…")
+        for name in se.PRESETS:
+            self.preset.addItem(name)
+        self.preset.activated.connect(self._apply_preset)
+        row.addWidget(self.preset, 1)
+        gl.addLayout(row)
+        self.editor = StyleEditor()
+        self.editor.changed.connect(self._on_style_changed)
+        gl.addWidget(self.editor)
+        row = QHBoxLayout()
+        b = QPushButton("Appliquer à tous les groupes")
+        b.clicked.connect(self._style_to_all)
+        row.addWidget(b)
+        b = QPushButton("Style par défaut")
+        b.setToolTip("Les nouveaux groupes utiliseront ce style")
+        b.clicked.connect(self._save_default_style)
+        row.addWidget(b)
+        gl.addLayout(row)
+        pv.addWidget(g)
+
+        g = QGroupBox("Matte finale")
+        gl = QVBoxLayout(g)
+        self.cb_invert = QCheckBox("Inverser la matte finale")
+        self.cb_invert.setChecked(True)
+        self.cb_invert.toggled.connect(self._schedule_overlay)
+        gl.addWidget(self.cb_invert)
+        pv.addWidget(g)
+        pv.addStretch(1)
+        self._group_widgets_enabled(False)
+        return panel
+
+    def _tab_export(self) -> QWidget:
+        panel = QWidget()
+        pv = QVBoxLayout(panel)
+        pv.setContentsMargins(8, 4, 10, 10)
+        g = QGroupBox("Exporter" + (" vers DaVinci Resolve" if self.job else ""))
         gl = QVBoxLayout(g)
         row = QHBoxLayout()
         self.out_edit = QLineEdit()
@@ -878,13 +1187,16 @@ class StudioWindow(QMainWindow):
         self.name_edit.setPlaceholderText("Nom des fichiers")
         gl.addWidget(self.name_edit)
         row = QHBoxLayout()
-        self.cb_matte = QCheckBox("Matte N&B")
+        self.cb_matte = QCheckBox("Matte N&&B")
         self.cb_matte.setChecked(True)
         self.codec = QComboBox()
         self.codec.addItems(["ProRes 422 HQ (.mov)", "DNxHR HQ (.mov)", "H.264 (.mp4)", "PNG (séquence)"])
         row.addWidget(self.cb_matte)
         row.addWidget(self.codec, 1)
         gl.addLayout(row)
+        self.cb_per_group = QCheckBox("Une matte par groupe en plus")
+        self.cb_per_group.setToolTip("Utile pour corriger chaque groupe avec un nœud différent")
+        gl.addWidget(self.cb_per_group)
         self.cb_data = QCheckBox("Trajectoires CSV + JSON")
         self.cb_data.setChecked(True)
         gl.addWidget(self.cb_data)
@@ -906,37 +1218,21 @@ class StudioWindow(QMainWindow):
             gl.addWidget(help_label("Le nœud Fusion choisi est inséré directement dans la comp "
                                     "du clip, dans Resolve."))
         self.cb_preview = QCheckBox("Vidéo de contrôle (preview)")
+        self.cb_preview.setChecked(True)
         gl.addWidget(self.cb_preview)
         self.b_export = QPushButton("⇪  Exporter et envoyer à Resolve" if self.job else "⇪  Exporter")
         self.b_export.setObjectName("primary")
         self.b_export.clicked.connect(self.start_export)
         self.b_export.setEnabled(False)
         gl.addWidget(self.b_export)
+        self.prog_exp = QProgressBar()
+        self.prog_exp.setRange(0, 1000)
+        gl.addWidget(self.prog_exp)
+        self.lbl_exp = help_label("")
+        gl.addWidget(self.lbl_exp)
         pv.addWidget(g)
         pv.addStretch(1)
-
-        self.statusBar().showMessage("Ouvrez une vidéo pour commencer.")
-
-        # raccourcis
-        def sc(key, fn):
-            a = QAction(self)
-            a.setShortcut(QKeySequence(key))
-            a.setShortcutContext(Qt.ApplicationShortcut)
-            a.triggered.connect(fn)
-            self.addAction(a)
-        sc("Space", self.toggle_play)
-        sc("Left", lambda: self.set_frame(self.cur - 1))
-        sc("Right", lambda: self.set_frame(self.cur + 1))
-        sc("Home", lambda: self.set_frame(self.seg_in))
-        sc("End", lambda: self.set_frame(self.seg_out))
-        sc("I", lambda: self.in_spin.setValue(self.cur))
-        sc("O", lambda: self.out_spin.setValue(self.cur))
-        sc("F", lambda: self.viewer.fit())
-        sc("A", lambda: self.tool_btns["point"].setChecked(True))
-        sc("Z", lambda: self.tool_btns["lasso"].setChecked(True))
-        sc("R", lambda: self.tool_btns["rect"].setChecked(True))
-        sc("Ctrl+Z", self.undo_last)
-        sc("Ctrl+O", self._ask_open)
+        return panel
 
     # --------------------------------------------------------------- état
     def n_frames(self) -> int:
@@ -951,32 +1247,60 @@ class StudioWindow(QMainWindow):
     def view_mode(self) -> str:
         return ["points", "overlay", "matte"][self.view_combo.currentIndex()]
 
-    def display_pos(self, i: int):
-        if i < self.n_tracked and self.rd is not None:
-            x, y = self.rd.smoothed[self.cur, i]
-            if np.isfinite(x) and self.res.tracked[self.cur]:
-                return float(x), float(y)
-            return None
-        if i < len(self.pts):
-            return float(self.pts[i, 0]), float(self.pts[i, 1])
+    def show_points_on_matte(self) -> bool:
+        return self.cb_points_on_matte.isChecked()
+
+    def group_by_id(self, gid: int) -> Optional[ShapeGroup]:
+        for g in self.groups:
+            if g.id == gid:
+                return g
         return None
 
-    def matte_params(self, scale: float = 1.0, max_side: int = 1920) -> eng.MatteParams:
-        return eng.MatteParams(
-            radius=self.m_radius.value() * scale, merge=self.m_merge.value(),
-            threshold=self.m_thr.value(), edge_softness=self.m_soft.value(),
-            motion_mode=["none", "scale", "stretch", "both"][self.m_motion.currentIndex()],
-            motion_sensitivity=self.m_sens.value(), render_max_side=max_side,
-            invert=self.m_invert.isChecked())
+    def point_colors(self) -> List[QColor]:
+        cmap = {g.id: g.color for g in self.groups}
+        grey = QColor(180, 180, 180)
+        return [cmap.get(int(gid), grey) if self.group_by_id(int(gid)) and
+                self.group_by_id(int(gid)).enabled else grey for gid in self.pgroup]
+
+    def display_positions(self) -> Optional[np.ndarray]:
+        n = len(self.pts)
+        if n == 0:
+            return None
+        xy = self.pts.astype(np.float64).copy()
+        if self.rd is not None and self.n_tracked:
+            t = self.cur
+            cur = self.rd.smoothed[t, :self.n_tracked].astype(np.float64)
+            if not self.res.tracked[t]:
+                cur[:] = np.nan
+            xy[:self.n_tracked] = cur
+        return xy
 
     # --------------------------------------------------------- ouverture
     def _ask_open(self):
-        p, _ = QFileDialog.getOpenFileName(self, "Ouvrir une vidéo", "",
-                                           "Vidéos (*.mp4 *.mov *.mxf *.mkv *.avi);;Tous (*.*)")
+        p, _ = QFileDialog.getOpenFileName(
+            self, "Ouvrir une vidéo ou un projet", "",
+            "Vidéos et projets (*.mp4 *.mov *.mxf *.mkv *.avi *.tapnext);;Tous (*.*)")
         if p:
-            self.open_video(p)
+            if p.lower().endswith(".tapnext"):
+                self.load_project(p)
+            else:
+                self.open_video(p)
 
-    def open_video(self, path: str):
+    def _reset_points(self):
+        self.pts = np.zeros((0, 2), np.float32)
+        self.qf = np.zeros(0, int)
+        self.pgroup = np.zeros(0, int)
+        self.sel = np.zeros(0, bool)
+        self.groups = []
+        self.res = self.rd = None
+        self.n_tracked = 0
+        self.tracked_seg = None
+        self.res_version += 1
+        self._gcache.clear()
+        self.undo.clear()
+        self._refresh_group_list()
+
+    def open_video(self, path: str) -> bool:
         if self.loader is not None:
             self.loader.stop_flag.set()
             self.loader.wait()
@@ -984,13 +1308,9 @@ class StudioWindow(QMainWindow):
             store = VideoStore(path)
         except Exception as e:
             QMessageBox.critical(self, APP_NAME, f"Impossible d'ouvrir la vidéo :\n{e}")
-            return
+            return False
         self.store = store
-        self.pts = np.zeros((0, 2), np.float32)
-        self.qf = np.zeros(0, int)
-        self.res = self.rd = None
-        self.n_tracked = 0
-        self.undo.clear()
+        self._reset_points()
         n = store.total
         for sp in (self.frame_spin, self.in_spin, self.out_spin):
             sp.blockSignals(True)
@@ -1013,10 +1333,10 @@ class StudioWindow(QMainWindow):
         self.loader.failed.connect(lambda m: QMessageBox.critical(self, APP_NAME, m))
         self.loader.start()
         self.cur = -1
-        self.viewer.fit_pending = True
         self.viewer.fit()
         QTimer.singleShot(200, lambda: self.set_frame(self.seg_in))
         self._update_labels()
+        return True
 
     def _on_load_progress(self, n):
         self.statusBar().showMessage(f"Chargement de la vidéo : {n} / {self.store.total} images…")
@@ -1098,6 +1418,176 @@ class StudioWindow(QMainWindow):
         self.seg_out = max(self.out_spin.value(), self.seg_in)
         self.timeline.update()
 
+    # ------------------------------------------------------------- groupes
+    def new_group(self, name: Optional[str] = None, style: Optional["se.ShapeStyle"] = None) -> ShapeGroup:
+        gid = self._next_gid
+        self._next_gid += 1
+        g = ShapeGroup(gid, name or f"Groupe {gid + 1}",
+                       style or se.ShapeStyle.from_dict(self.default_style.to_dict()))
+        self.groups.append(g)
+        self._refresh_group_list(select=gid)
+        return g
+
+    def current_group(self) -> Optional[ShapeGroup]:
+        row = self.group_list.currentRow()
+        return self.groups[row] if 0 <= row < len(self.groups) else None
+
+    def _refresh_group_list(self, select: Optional[int] = None):
+        cur = self.current_group()
+        sel_id = select if select is not None else (cur.id if cur else None)
+        self.group_list.blockSignals(True)
+        self.group_list.clear()
+        row_sel = -1
+        for i, g in enumerate(self.groups):
+            n = int((self.pgroup == g.id).sum())
+            mode = "découpe" if g.style.mode == "subtract" else se.SHAPE_LABELS[g.style.shape].lower()
+            it = QListWidgetItem(color_icon(g.color), f"{g.name}   ·  {n} pts  ·  {mode}")
+            it.setFlags(it.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEditable)
+            it.setCheckState(Qt.Checked if g.enabled else Qt.Unchecked)
+            it.setData(Qt.UserRole, g.id)
+            self.group_list.addItem(it)
+            if g.id == sel_id:
+                row_sel = i
+        if row_sel < 0 and self.groups:
+            row_sel = len(self.groups) - 1
+        self.group_list.setCurrentRow(row_sel)
+        self.group_list.blockSignals(False)
+        self._on_group_row(row_sel)
+
+    def _on_group_row(self, row: int):
+        g = self.groups[row] if 0 <= row < len(self.groups) else None
+        self._group_widgets_enabled(g is not None)
+        if g is not None:
+            self.editor.set_style(g.style)
+
+    def _group_widgets_enabled(self, on: bool):
+        if hasattr(self, "editor"):
+            self.editor.setEnabled(on)
+            self.preset.setEnabled(on)
+
+    def _on_group_item_changed(self, it: QListWidgetItem):
+        g = self.group_by_id(it.data(Qt.UserRole))
+        if g is None:
+            return
+        g.enabled = it.checkState() == Qt.Checked
+        text = it.text().split("   ·  ")[0].strip()
+        if text and text != g.name:
+            g.name = text
+            QTimer.singleShot(0, self._refresh_group_list)
+        self.viewer.update()
+        self._schedule_overlay()
+
+    def _on_style_changed(self, key: str):
+        if key in ("shape", "mode"):
+            self._refresh_group_list()
+        self._schedule_overlay()
+
+    def _apply_preset(self, idx: int):
+        g = self.current_group()
+        if g is None or idx <= 0:
+            return
+        name = self.preset.itemText(idx)
+        d = se.ShapeStyle().to_dict()
+        d.update(se.PRESETS[name])
+        g.style = se.ShapeStyle.from_dict(d)
+        self.editor.set_style(g.style)
+        self.preset.setCurrentIndex(0)
+        self._refresh_group_list()
+        self._schedule_overlay()
+
+    def _style_to_all(self):
+        g = self.current_group()
+        if g is None:
+            return
+        for o in self.groups:
+            if o is not g:
+                o.style = se.ShapeStyle.from_dict(g.style.to_dict())
+        self._refresh_group_list()
+        self._schedule_overlay()
+
+    def _save_default_style(self):
+        g = self.current_group()
+        if g is None:
+            return
+        self.default_style = se.ShapeStyle.from_dict(g.style.to_dict())
+        try:
+            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump({"default_style": self.default_style.to_dict()}, f, indent=1)
+            self.statusBar().showMessage("Style enregistré comme style par défaut.", 5000)
+        except OSError as e:
+            QMessageBox.warning(self, APP_NAME, f"Impossible d'enregistrer : {e}")
+
+    def delete_group(self):
+        g = self.current_group()
+        if g is None or self._busy():
+            return
+        self.delete_points(np.nonzero(self.pgroup == g.id)[0], drop_group=g.id)
+
+    def select_group_points(self):
+        g = self.current_group()
+        if g is not None:
+            self.sel = self.pgroup == g.id
+            self._sel_changed()
+
+    # ----------------------------------------------------------- sélection
+    def _sel_changed(self):
+        n = int(self.sel.sum())
+        self.lbl_sel.setText(f"{n} point(s) sélectionné(s)" if n else "Aucun point sélectionné")
+        self.b_new_group.setEnabled(n > 0)
+        self.b_del_sel.setEnabled(n > 0)
+        self.viewer.update()
+
+    def select_rect(self, x0, y0, x1, y1, add=False):
+        xy = self.display_positions()
+        if xy is None:
+            return
+        inside = (xy[:, 0] >= x0) & (xy[:, 0] <= x1) & (xy[:, 1] >= y0) & (xy[:, 1] <= y1)
+        self.sel = (self.sel | inside) if add else inside
+        self._sel_changed()
+        if self.sel.any():
+            self.tabs.setCurrentIndex(1)
+
+    def select_point(self, i: int, add=False):
+        if not add:
+            self.sel[:] = False
+        if i >= 0:
+            self.sel[i] = not self.sel[i] if add else True
+            g = self.group_by_id(int(self.pgroup[i]))
+            if g is not None:
+                self.group_list.setCurrentRow(self.groups.index(g))
+        self._sel_changed()
+
+    def select_all(self):
+        self.sel[:] = True
+        self._sel_changed()
+
+    def clear_selection(self):
+        self.sel[:] = False
+        self._sel_changed()
+
+    def group_from_selection(self):
+        if not self.sel.any():
+            return
+        src = self.group_by_id(int(self.pgroup[np.argmax(self.sel)]))
+        style = se.ShapeStyle.from_dict(src.style.to_dict()) if src else None
+        g = self.new_group(f"Sélection {self._next_gid + 1}", style)
+        self.pgroup[self.sel] = g.id
+        self.sel[:] = False
+        self._drop_empty_groups()
+        self._gcache.clear()
+        self._refresh_group_list(select=g.id)
+        self._sel_changed()
+        self._schedule_overlay()
+        self.statusBar().showMessage(f"Groupe « {g.name} » créé : réglez son style ci-dessous.", 6000)
+
+    def delete_selection(self):
+        if self.sel.any():
+            self.delete_points(np.nonzero(self.sel)[0])
+
+    def _drop_empty_groups(self):
+        used = set(int(v) for v in self.pgroup)
+        self.groups = [g for g in self.groups if g.id in used]
+
     # ------------------------------------------------------------- points
     def _busy(self) -> bool:
         if self.tracker_thread is not None:
@@ -1105,7 +1595,8 @@ class StudioWindow(QMainWindow):
             return True
         return False
 
-    def add_points(self, pts: np.ndarray, frame: Optional[int] = None):
+    def add_points(self, pts: np.ndarray, frame: Optional[int] = None, new_group: bool = True,
+                   name: Optional[str] = None):
         if not len(pts) or not self.store or self._busy():
             return
         W, H = self.store.info.width, self.store.info.height
@@ -1114,12 +1605,18 @@ class StudioWindow(QMainWindow):
         pts[:, 1] = np.clip(pts[:, 1], 0, H - 1)
         f = self.cur if frame is None else frame
         if not (self.seg_in <= f <= self.seg_out):
-            # Poser un point hors plage élargit la plage de suivi.
-            self.in_spin.setValue(min(self.seg_in, f))
-            self.out_spin.setValue(max(self.seg_out, f))
+            self._set_range(min(self.seg_in, f), max(self.seg_out, f))
+            self._range_user = True
+        g = None if new_group else self.current_group()
+        if g is None:
+            g = self.new_group(name or (f"Zone {self._next_gid + 1}" if new_group
+                                        else f"Points {self._next_gid + 1}"))
         self.pts = np.concatenate([self.pts, pts.astype(np.float32)])
         self.qf = np.concatenate([self.qf, np.full(len(pts), f, int)])
+        self.pgroup = np.concatenate([self.pgroup, np.full(len(pts), g.id, int)])
+        self.sel = np.concatenate([self.sel, np.zeros(len(pts), bool)])
         self.undo.append(len(pts))
+        self._refresh_group_list(select=g.id)
         self._update_labels()
         self.viewer.update()
         self.timeline.update()
@@ -1141,7 +1638,8 @@ class StudioWindow(QMainWindow):
             return
         self.add_points(pts)
         self.statusBar().showMessage(
-            f"{len(pts)} points placés sur l'image {self.cur}. Lancez le suivi (②).", 8000)
+            f"{len(pts)} points placés sur l'image {self.cur} (nouveau groupe). "
+            "Lancez le suivi.", 8000)
 
     def fill_full(self):
         st = self.store
@@ -1152,16 +1650,20 @@ class StudioWindow(QMainWindow):
         self.fill_zone(np.array([[W * m, H * m], [W * (1 - m), H * m],
                                  [W * (1 - m), H * (1 - m)], [W * m, H * (1 - m)]], np.float32))
 
-    def delete_point(self, i: int):
+    def delete_points(self, idx: np.ndarray, drop_group: Optional[int] = None):
         if self._busy():
             return
         keep = np.ones(len(self.pts), bool)
-        keep[i] = False
+        keep[np.asarray(idx, int)] = False
         self._keep_points(keep)
+        if drop_group is not None:
+            self.groups = [g for g in self.groups if g.id != drop_group]
+            self._refresh_group_list()
 
     def _keep_points(self, keep: np.ndarray):
         nt = self.n_tracked
         self.pts, self.qf = self.pts[keep], self.qf[keep]
+        self.pgroup, self.sel = self.pgroup[keep], self.sel[keep]
         if self.res is not None and nt:
             kt = keep[:nt]
             r = self.res
@@ -1171,12 +1673,13 @@ class StudioWindow(QMainWindow):
             self.n_tracked = int(kt.sum())
             if self.n_tracked == 0:
                 self.res = self.rd = None
-            else:
-                self._recompute_rd()
+            self._tracking_changed()
+        self._drop_empty_groups()
         self.undo.clear()
+        self._refresh_group_list()
         self._update_labels()
+        self._sel_changed()
         self.viewer.hover = -1
-        self.viewer.update()
         self.timeline.update()
 
     def undo_last(self):
@@ -1195,12 +1698,9 @@ class StudioWindow(QMainWindow):
     def clear_points(self):
         if self._busy():
             return
-        self.pts = np.zeros((0, 2), np.float32)
-        self.qf = np.zeros(0, int)
-        self.res = self.rd = None
-        self.n_tracked = 0
-        self.undo.clear()
+        self._reset_points()
         self._update_labels()
+        self._sel_changed()
         self._refresh_overlay()
         self.timeline.update()
 
@@ -1229,7 +1729,6 @@ class StudioWindow(QMainWindow):
             QMessageBox.information(self, APP_NAME, "La vidéo est encore en cours de chargement.")
             return
         seg = (self.seg_in, self.seg_out)
-        # Les nouveaux points seuls si la plage n'a pas changé, sinon tout.
         if self.res is not None and self.tracked_seg == seg and self.n_tracked:
             first = self.n_tracked
         else:
@@ -1250,8 +1749,9 @@ class StudioWindow(QMainWindow):
         self.tracker_thread.start()
 
     def _on_progress(self, desc: str, frac: float):
-        self.prog.setValue(int(frac * 1000))
-        self.lbl_prog.setText(desc)
+        bar, lbl = (self.prog_exp, self.lbl_exp) if self.export_thread is not None else (self.prog, self.lbl_prog)
+        bar.setValue(int(frac * 1000))
+        lbl.setText(desc)
         self.statusBar().showMessage(f"{desc}… {frac * 100:.0f} %")
 
     def _on_tracked(self, r, first: int, seg):
@@ -1265,19 +1765,20 @@ class StudioWindow(QMainWindow):
             self.res = r
         self.n_tracked = first + r.positions.shape[1]
         self.tracked_seg = seg
-        self._recompute_rd()
+        self._tracking_changed()
         self.prog.setValue(1000)
         n_cut = int((r.cut_frames >= 0).sum())
         msg = (f"Suivi terminé en {getattr(r, 'elapsed', 0):.0f} s sur {getattr(r, 'device', '?')}"
                + (f" · {n_cut} point(s) coupé(s) au décrochage" if n_cut else ""))
         self.lbl_prog.setText(msg)
-        self.statusBar().showMessage(msg + ". Lecture : Espace.", 15000)
+        self.statusBar().showMessage(msg + ". Réglez les formes dans l'onglet ②.", 15000)
         self._update_labels()
 
     def _on_failed(self, msg: str):
-        self.lbl_prog.setText(msg)
+        for lbl in (self.lbl_prog, self.lbl_exp):
+            lbl.setText(msg)
         self.statusBar().showMessage(msg, 15000)
-        if not msg.endswith("annulé.") and not msg.endswith("annulé"):
+        if "annulé" not in msg:
             QMessageBox.warning(self, APP_NAME, msg)
 
     def _thread_finished(self):
@@ -1292,41 +1793,54 @@ class StudioWindow(QMainWindow):
                 t.cancel.set()
 
     # ------------------------------------------------------------ rendu
-    def _recompute_rd(self):
+    def _tracking_changed(self):
+        self.res_version += 1
+        self._gcache.clear()
         if self.res is None:
             self.rd = None
         else:
-            self.rd = eng.prepare_render_data(self.res, self.m_smooth.value(), 0.5,
-                                              int(self.m_fin.value()), int(self.m_fout.value()))
+            self.rd = eng.prepare_render_data(self.res, 1.0, 0.5, 6, 8)
+        self._refresh_group_list()
         self._refresh_overlay()
 
+    def _group_data(self, g: ShapeGroup) -> Optional["se.GroupData"]:
+        if self.res is None or not self.n_tracked:
+            return None
+        cols = np.nonzero(self.pgroup[:self.n_tracked] == g.id)[0]
+        if not len(cols):
+            return None
+        st = g.style
+        key = (self.res_version, tuple(cols[:8]), len(cols), st.smooth, st.always_visible,
+               st.fade_in_on, st.fade_in, st.fade_out_on, st.fade_out, st.size_jitter)
+        hit = self._gcache.get(g.id)
+        if hit is not None and hit[0] == key:
+            return hit[1]
+        gd = se.prepare_group(self.res, cols, st)
+        self._gcache[g.id] = (key, gd)
+        return gd
+
+    def layers(self) -> list:
+        return [(g.style, self._group_data(g), g.enabled) for g in self.groups]
+
     def _schedule_overlay(self, *_):
-        self.render_timer.start(30)
+        self.render_timer.start(25)
 
     def _refresh_overlay(self):
         v = self.viewer
-        if self.rd is None or self.view_mode() == "points" or not self.store:
+        if self.res is None or self.view_mode() == "points" or not self.store:
             v.overlay = None
-            if self.store and self.view_mode() == "matte":
-                black = QImage(self.store.pw, self.store.ph, QImage.Format_RGB888)
-                black.fill(QColor("black"))
-                v.overlay = black
             v.update()
             return
         st, t = self.store, self.cur
-        rd = self.rd
-        key = (st.pw, st.ph, self.m_radius.value(), self.m_merge.value(), self.m_thr.value(),
-               self.m_soft.value(), self.m_motion.currentIndex(), self.m_sens.value(),
-               self.m_invert.isChecked())
+        key = (st.pw, st.ph)
         if getattr(self, "_rkey", None) != key:
-            self._renderer = eng.MatteRenderer(st.pw, st.ph, self.matte_params(st.scale, 960))
+            self._renderer = se.ShapeRenderer(st.info.width, st.info.height, st.pw, st.ph, 960)
             self._rkey = key
-        s = st.scale
-        m = self._renderer.render(rd.draw_pos[t] * s, rd.alpha[t], rd.speed[t] * s, rd.direction[t])
+        layers = [L for L in self.layers() if L[1] is not None]
+        m = self._renderer.render(layers, t, self.cb_invert.isChecked()) if layers else \
+            np.full((st.ph, st.pw), 255 if self.cb_invert.isChecked() else 0, np.uint8)
         if self.view_mode() == "matte":
-            g = np.ascontiguousarray(m)
-            self._ov_ref = g
-            v.overlay = QImage(g.data, g.shape[1], g.shape[0], g.strides[0], QImage.Format_Grayscale8)
+            v.overlay = np_to_qimage_gray(m)
         else:
             rgba = np.zeros((m.shape[0], m.shape[1], 4), np.uint8)
             rgba[..., 0], rgba[..., 1], rgba[..., 2] = 255, 70, 60
@@ -1335,6 +1849,72 @@ class StudioWindow(QMainWindow):
             v.overlay = QImage(rgba.data, rgba.shape[1], rgba.shape[0], rgba.strides[0],
                                QImage.Format_RGBA8888)
         v.update()
+
+    # ------------------------------------------------------------ projet
+    def save_project(self):
+        if not self.store:
+            return
+        base = os.path.splitext(self.store.path)[0] + ".tapnext"
+        p, _ = QFileDialog.getSaveFileName(self, "Enregistrer le projet", base,
+                                           "Projet TAPNext (*.tapnext)")
+        if not p:
+            return
+        meta = dict(video=self.store.path, seg=[self.seg_in, self.seg_out], cur=self.cur,
+                    n_tracked=self.n_tracked, tracked_seg=self.tracked_seg,
+                    invert=self.cb_invert.isChecked(), next_gid=self._next_gid,
+                    groups=[dict(id=g.id, name=g.name, enabled=g.enabled,
+                                 style=g.style.to_dict()) for g in self.groups])
+        arrays = dict(pts=self.pts, qf=self.qf, pgroup=self.pgroup,
+                      meta=np.frombuffer(json.dumps(meta).encode("utf-8"), np.uint8))
+        if self.res is not None:
+            r = self.res
+            arrays.update(positions=r.positions, visibility=r.visibility, tracked=r.tracked,
+                          query_frames=r.query_frames, cut_frames=r.cut_frames)
+        try:
+            with open(p, "wb") as f:
+                np.savez_compressed(f, **arrays)
+            self.statusBar().showMessage(f"Projet enregistré : {p}", 8000)
+        except OSError as e:
+            QMessageBox.warning(self, APP_NAME, f"Impossible d'enregistrer : {e}")
+
+    def load_project(self, p: str):
+        try:
+            z = np.load(p, allow_pickle=False)
+            meta = json.loads(bytes(z["meta"]).decode("utf-8"))
+        except Exception as e:
+            QMessageBox.critical(self, APP_NAME, f"Projet illisible :\n{e}")
+            return
+        video = meta.get("video", "")
+        if not os.path.isfile(video):
+            video, _ = QFileDialog.getOpenFileName(self, "Vidéo du projet introuvable : où est-elle ?",
+                                                   os.path.dirname(p))
+            if not video:
+                return
+        if not self.open_video(video):
+            return
+        self.pts, self.qf, self.pgroup = z["pts"], z["qf"], z["pgroup"]
+        self.sel = np.zeros(len(self.pts), bool)
+        self.groups = []
+        for d in meta.get("groups", []):
+            g = ShapeGroup(int(d["id"]), d["name"], se.ShapeStyle.from_dict(d["style"]))
+            g.enabled = bool(d.get("enabled", True))
+            self.groups.append(g)
+        self._next_gid = int(meta.get("next_gid", len(self.groups)))
+        self.cb_invert.setChecked(bool(meta.get("invert", True)))
+        a, b = meta.get("seg", [self.seg_in, self.seg_out])
+        self._set_range(int(a), int(b))
+        self._range_user = True
+        if "positions" in z.files:
+            self.res = eng.TrackResult(z["positions"], z["visibility"], z["tracked"],
+                                       z["query_frames"], z["cut_frames"])
+            self.n_tracked = int(meta.get("n_tracked", self.res.positions.shape[1]))
+            ts = meta.get("tracked_seg")
+            self.tracked_seg = tuple(ts) if ts else None
+        self._tracking_changed()
+        self._update_labels()
+        self._sel_changed()
+        QTimer.singleShot(250, lambda: self.set_frame(int(meta.get("cur", self.seg_in)), force=True))
+        self.statusBar().showMessage(f"Projet ouvert : {os.path.basename(p)}", 8000)
 
     # ------------------------------------------------------------ export
     def start_export(self):
@@ -1346,11 +1926,14 @@ class StudioWindow(QMainWindow):
             QMessageBox.warning(self, APP_NAME, "Choisissez un dossier de sortie.")
             return
         info = self.store.info
-        n_full = len(self.res.tracked)
-        if n_full != self.store.total:   # aligne sur le nombre réel d'images
+        if len(self.res.tracked) != self.store.total:
             self._pad_result(self.store.total)
         vals, counts = np.unique(self.res.query_frames, return_counts=True)
         ref = int(vals[np.argmax(counts)])
+        groups = [g for g in self.groups]
+        layers = [(se.ShapeStyle.from_dict(g.style.to_dict()), self._group_data(g), g.enabled)
+                  for g in groups]
+        keep = [i for i, L in enumerate(layers) if L[1] is not None]
         job = dict(
             info=info, res=self.res, rd=self.rd, pts=self.pts[:self.n_tracked],
             out_dir=out_dir, name=name,
@@ -1361,12 +1944,18 @@ class StudioWindow(QMainWindow):
             ["none", "stabilize", "matchmove", "both"][self.fusion_mode.currentIndex()],
             fusion_to_resolve=["none", "stabilize", "matchmove", "both"][self.fusion_mode.currentIndex()],
             fusion_smooth=int(self.fusion_smooth.value()),
-            preview=self.cb_preview.isChecked(), mparams=self.matte_params(),
+            preview=self.cb_preview.isChecked(),
+            layers=[layers[i] for i in keep], group_names=[groups[i].name for i in keep],
+            per_group=self.cb_per_group.isChecked(), invert=self.cb_invert.isChecked(),
             ref_frame=ref, job_mode=bool(self.job),
             params=dict(start_frame=ref, segment=[self.seg_in, self.seg_out],
-                        radius=self.m_radius.value(), merge=self.m_merge.value(),
-                        threshold=self.m_thr.value()),
+                        groups=[dict(name=g.name, enabled=g.enabled, style=g.style.to_dict(),
+                                     points=[int(i) for i in np.nonzero(self.pgroup[:self.n_tracked] == g.id)[0]])
+                                for g in groups]),
         )
+        if not job["layers"]:
+            QMessageBox.warning(self, APP_NAME, "Aucun groupe de points suivis à exporter.")
+            return
         self.export_thread = ExportThread(job)
         self.export_thread.progress.connect(self._on_progress)
         self.export_thread.done.connect(lambda outs: self._on_exported(outs, job))
@@ -1374,6 +1963,7 @@ class StudioWindow(QMainWindow):
         self.export_thread.finished.connect(self._thread_finished)
         self.b_export.setEnabled(False)
         self.b_cancel.setEnabled(True)
+        self.prog_exp.setValue(0)
         self.export_thread.start()
 
     def _pad_result(self, n: int):
@@ -1385,15 +1975,16 @@ class StudioWindow(QMainWindow):
             r.tracked = np.concatenate([r.tracked, np.zeros(n - T, bool)])
         else:
             r.positions, r.visibility, r.tracked = r.positions[:n], r.visibility[:n], r.tracked[:n]
-        self._recompute_rd()
+        self._tracking_changed()
 
     def _on_exported(self, outputs: list, job: dict):
-        self.prog.setValue(1000)
-        self.lbl_prog.setText("Export terminé.")
+        self.prog_exp.setValue(1000)
+        self.lbl_exp.setText("Export terminé.")
         if self.job:
             base = os.path.join(job["out_dir"], job["name"])
             mode = job["fusion_to_resolve"]
-            done = dict(status="ok", matte=next((o for o in outputs if "_matte" in o), ""),
+            done = dict(status="ok", matte=next((o for o in outputs if o.endswith(("_matte.mov", "_matte.mp4"))
+                                                 or "_matte_png" in o), ""),
                         csv=base + "_tracks.csv", outputs=outputs,
                         query_frame=job["ref_frame"], job_id=str(self.job.get("job_id", "")),
                         fusion_mode="stabilize" if mode == "both" else mode,
@@ -1401,7 +1992,7 @@ class StudioWindow(QMainWindow):
             with open(self.job["done"], "w", encoding="utf-8") as f:
                 json.dump(done, f, ensure_ascii=False, indent=1)
             self.job_sent = True
-            self.lbl_prog.setText("Export terminé — en attente de DaVinci Resolve…")
+            self.lbl_exp.setText("Export terminé — en attente de DaVinci Resolve…")
             self._ack_deadline = time.time() + 20
             self._ack_timer = QTimer(self)
             self._ack_timer.timeout.connect(self._poll_ack)
@@ -1423,14 +2014,14 @@ class StudioWindow(QMainWindow):
         if ack is not None and str(ack.get("job_id", "")) in ("", str(self.job.get("job_id", ""))):
             self._ack_timer.stop()
             ok = ack.get("status") == "ok"
-            self.lbl_prog.setText("Importé dans DaVinci Resolve." if ok else "Import incomplet.")
+            self.lbl_exp.setText("Importé dans DaVinci Resolve." if ok else "Import incomplet.")
             (QMessageBox.information if ok else QMessageBox.warning)(
                 self, APP_NAME, "DaVinci Resolve :\n\n" + ack.get("report", "")
                 + ("\n\nVous pouvez fermer TAPNext Studio." if ok else ""))
             return
         if time.time() > self._ack_deadline:
             self._ack_timer.stop()
-            self.lbl_prog.setText("Export terminé. Import : relancez le script dans Resolve.")
+            self.lbl_exp.setText("Export terminé. Import : relancez le script dans Resolve.")
             QMessageBox.information(
                 self, APP_NAME,
                 "Export terminé.\n\nPour importer dans DaVinci Resolve :\n"
@@ -1471,8 +2062,7 @@ def dark_palette(app: QApplication):
 
 def _setup_logging() -> None:
     """Journal dans logs/studio.log. Sous Windows (pythonw), il n'y a pas de
-    console : stdout/stderr sont redirigés vers ce fichier (barres de
-    progression du téléchargement, erreurs…)."""
+    console : stdout/stderr sont redirigés vers ce fichier."""
     import logging
 
     log_dir = os.path.join(HERE, "logs")
@@ -1492,7 +2082,7 @@ IS_PYTHONW = os.path.basename(sys.executable).lower().startswith("pythonw")
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=APP_NAME)
-    ap.add_argument("video", nargs="?", default="")
+    ap.add_argument("video", nargs="?", default="", help="Vidéo ou projet .tapnext")
     ap.add_argument("--job", help="Fichier de tâche envoyé par DaVinci Resolve (JSON)")
     a = ap.parse_args(argv)
     _setup_logging()
@@ -1503,7 +2093,11 @@ def main(argv=None) -> int:
     app = QApplication(sys.argv[:1])
     app.setApplicationName(APP_NAME)
     dark_palette(app)
-    win = StudioWindow((job or {}).get("video") or a.video, job)
+    target = (job or {}).get("video") or a.video
+    is_project = target.lower().endswith(".tapnext")
+    win = StudioWindow("" if is_project else target, job)
+    if is_project:
+        QTimer.singleShot(50, lambda: win.load_project(target))
     win.show()
     return app.exec()
 

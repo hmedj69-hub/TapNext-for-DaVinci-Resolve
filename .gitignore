@@ -6,3 +6,5 @@ checkpoints/
 *_matte.mp4
 *_matte_png/
 *_preview.mp4
+tools/
+tap_gui_settings.json

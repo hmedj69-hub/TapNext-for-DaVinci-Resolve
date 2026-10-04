@@ -14,13 +14,40 @@ jusqu'à 1024 images et plus) avec **TAPNext++** de Google DeepMind
 
 ```
 tap_resolve_tool.py   ← script principal (tracking, mattes, exports)
+tap_gui.py            ← interface graphique
 fusion_export.py      ← CSV → nœuds Fusion (sans dépendance ; fonctionne aussi DANS Resolve)
+INSTALLER_Windows.bat, install.sh, TAPNext_Resolve.bat/.sh, TAPNext_CLI.bat
 requirements.txt
 ```
 
 ---
 
-## 1. Installation
+## ⚡ Installation en un clic (recommandé)
+
+**Windows** (RTX 3080 Laptop) :
+
+1. Téléchargez le dépôt (bouton **Code → Download ZIP** sur GitHub) et décompressez-le, par exemple dans `C:\TAPNext`. Évitez les dossiers synchronisés OneDrive.
+2. Double-cliquez sur **`INSTALLER_Windows.bat`**. Si Windows SmartScreen s'affiche : *Informations complémentaires → Exécuter quand même*.
+   Aucun prérequis : le script installe Python 3.11, PyTorch CUDA, TAPNext++, OpenCV et ffmpeg, puis télécharge le modèle (~5 Go au total, environ 10 à 20 min). **Tout reste dans ce dossier** : le système et une éventuelle autre installation de Python ne sont pas touchés. Si l'installation est interrompue, relancez le script : il reprend où il s'était arrêté.
+3. Double-cliquez sur **`TAPNext_Resolve.bat`** ou sur le raccourci **TAPNext++ Resolve** créé sur le Bureau. L'interface graphique s'ouvre : choisissez la vidéo, réglez les paramètres, cliquez sur **Lancer**.
+   - Vous pouvez aussi glisser une vidéo sur `TAPNext_Resolve.bat` : elle est pré-remplie.
+   - `TAPNext_CLI.bat` donne accès à la ligne de commande. Glisser une vidéo dessus lance un traitement avec les réglages par défaut.
+
+**Linux / macOS** : `./install.sh`, puis `./TAPNext_Resolve.sh`. Sur macOS, il n'y a pas de CUDA : l'outil tourne sur CPU.
+
+Pour désinstaller, supprimez le dossier, ainsi que le raccourci du Bureau.
+
+| Fichier | Rôle |
+|---|---|
+| `INSTALLER_Windows.bat` / `install.sh` | Installation automatique (via [uv](https://github.com/astral-sh/uv)) |
+| `TAPNext_Resolve.bat` / `.sh` | Interface graphique (`tap_gui.py`) |
+| `TAPNext_CLI.bat` | Ligne de commande |
+
+> Pourquoi pas un seul `.exe` ? PyTorch avec CUDA pèse à lui seul ~3 Go, et le modèle 2,5 Go. Un exécutable unique dépasserait 5 Go, serait lent à démarrer et souvent bloqué par les antivirus. L'installateur produit le même résultat, mais il est réparable et peut être mis à jour.
+
+---
+
+## 1. Installation manuelle (alternative)
 
 Testé avec Python 3.10 et 3.11. Utilisez un environnement virtuel.
 

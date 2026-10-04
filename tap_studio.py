@@ -2687,6 +2687,13 @@ class StudioWindow(QMainWindow):
         if not out_dir:
             QMessageBox.warning(self, APP_NAME, "Choisissez un dossier de sortie.")
             return
+        if self.job:
+            # Nom neuf à chaque export : Resolve garde les anciens fichiers ouverts
+            # (écrasement impossible, ou ré-import refusé du même fichier).
+            base, k = name, 2
+            while any(os.path.exists(os.path.join(out_dir, name + suf))
+                      for suf in ("_matte.mov", "_matte.mp4", "_matte_png", ".tapfx")):
+                name, k = f"{base}_v{k}", k + 1
         info = self.store.info
         if len(self.res.tracked) != self.store.total:
             self._pad_result(self.store.total)

@@ -515,6 +515,15 @@ def write_fusion_camera(path: str, cs: CameraSolve, frames, offset: int = 0,
     text = "{\n\tTools = ordered() {\n" + "\n".join(blocks) + '\n\t},\n\tActiveTool = "TAP_Camera3D"\n}\n'
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
+    specs = [dict(name="TAP_Camera3D", type="Camera3D",
+                  static={"FilmGate": "User", "ApertureW": ap_w, "ApertureH": ap_h, "FLength": flen},
+                  numbers={names[k]: keys[k] for k in names})]
+    for i, Xw in enumerate(locators if locators is not None else []):
+        Xf = S_FLIP @ Xw
+        specs.append(dict(name="TAP_Point3D_%d" % (i + 1), type="Locator3D", static={
+            "Transform3DOp.Translate.X": float(Xf[0]), "Transform3DOp.Translate.Y": float(Xf[1]),
+            "Transform3DOp.Translate.Z": float(Xf[2])}))
+    fx.write_tools_lua(path, specs)
     return text
 
 

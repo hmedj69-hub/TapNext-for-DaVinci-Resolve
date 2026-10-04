@@ -300,10 +300,17 @@ function M.attach_matte(resolve, ctx, matte_path)
 end
 
 --[[ Importe un fichier dans le chutier « TAPNext » du Media Pool (créé si
-     besoin). Renvoie true si l'élément a été ajouté. ]]
+     besoin). Renvoie true (ou true, "déjà là") si l'élément est dans le chutier,
+     sinon false et la raison. ]]
+function M.norm_path(p)
+  return (tostring(p or ""):gsub("\\", "/"):lower())
+end
+
 function M.import_to_bin(resolve, path)
-  local ok, res = pcall(function()
+  local reason = "raison inconnue"
+  local ok, res, extra = pcall(function()
     local proj = resolve:GetProjectManager():GetCurrentProject()
+    if not proj then return false, "aucun projet ouvert" end
     local mp = proj:GetMediaPool()
     local rootf = mp:GetRootFolder()
     local bin
@@ -311,15 +318,33 @@ function M.import_to_bin(resolve, path)
       if f:GetName() == "TAPNext" then bin = f end
     end
     if not bin then bin = mp:AddSubFolder(rootf, "TAPNext") end
+    bin = bin or rootf
+    -- déjà présent (même fichier) ?
+    local want = M.norm_path(path)
+    for _, c in pairs(bin:GetClipList() or {}) do
+      local okp, fp = pcall(function() return c:GetClipProperty("File Path") end)
+      if okp and M.norm_path(fp) == want then return true, "déjà dans le chutier" end
+    end
     local prev = mp:GetCurrentFolder()
-    if bin then mp:SetCurrentFolder(bin) end
-    local items = mp:ImportMedia({ path })
-    if prev then mp:SetCurrentFolder(prev) end
+    mp:SetCurrentFolder(bin)
     local n = 0
+    local items = mp:ImportMedia({ path })
     for _ in pairs(items or {}) do n = n + 1 end
-    return n > 0
+    if n == 0 then
+      -- Seconde méthode : via le stockage de médias (dossier courant = chutier).
+      local ms = resolve:GetMediaStorage()
+      local items2 = ms and ms:AddItemListToMediaPool({ path })
+      for _ in pairs(items2 or {}) do n = n + 1 end
+    end
+    if prev then mp:SetCurrentFolder(prev) end
+    if n == 0 then
+      return false, M.exists(path) and "Resolve refuse le fichier" or "fichier introuvable"
+    end
+    return true
   end)
-  return ok and res
+  if not ok then return false, tostring(res) end
+  if res then return true, extra end
+  return false, extra or reason
 end
 
 --[[ Comp Fusion du clip (créée si besoin) + décalage source → comp. ]]
@@ -345,35 +370,104 @@ function M.shift_setting(text, delta)
   end))
 end
 
-function M.paste_into_comp(comp, setting_text, insert_before_output)
-  local data = bmd.readstring(setting_text)
-  if not data then return false, "Fichier .setting illisible." end
+--[[ Construit les nœuds avec l'API (comp:AddTool) à partir du fichier
+     « _tools.lua » écrit par Studio. Ne dépend pas de l'affichage de la comp. ]]
+function M.load_tools(path)
+  local text = path and M.read_all(path)
+  if not text then return nil end
+  local loader = rawget(_G, "loadstring") or load
+  local fn = loader(text)
+  if not fn then return nil end
+  local ok, specs = pcall(fn)
+  return ok and type(specs) == "table" and specs or nil
+end
+
+function M.build_tools(comp, specs, delta)
+  local made = {}
+  for _, sp in ipairs(specs) do
+    local t = comp:AddTool(sp.type, -32768, -32768)
+    if not t then error("AddTool(" .. tostring(sp.type) .. ") a échoué") end
+    pcall(function() t:SetAttrs({ TOOLS_Name = sp.name }) end)
+    for k, v in pairs(sp.static or {}) do
+      pcall(function() t:SetInput(k, v) end)
+    end
+    for k, keys in pairs(sp.numbers or {}) do
+      t[k] = comp:BezierSpline()
+      local inp = t[k]
+      for f, v in pairs(keys) do inp[f + delta] = v end
+    end
+    for k, keys in pairs(sp.points or {}) do
+      t[k] = comp:XYPath()
+      local inp = t[k]
+      for f, v in pairs(keys) do inp[f + delta] = { v[1], v[2] } end
+    end
+    made[#made + 1] = t
+  end
+  return made
+end
+
+function M.wire_before_output(comp, tool)
+  local mo = (comp:GetToolList(false, "MediaOut") or {})[1]
+  if not (tool and mo) then return nil end
+  local src = mo.Input and mo.Input:GetConnectedOutput()
+  if src then
+    tool:ConnectInput("Input", src:GetTool())
+  else
+    local mi = (comp:GetToolList(false, "MediaIn") or {})[1]
+    if mi then tool:ConnectInput("Input", mi) end
+  end
+  mo:ConnectInput("Input", tool)
+  return "Stabilisation branchée avant " .. (mo.Name or "MediaOut") .. " : l'image est stabilisée."
+end
+
+--[[ Ajoute les nœuds d'un .setting dans la comp : collage (comp:Paste), puis,
+     s'il échoue, construction par l'API. Renvoie ok, message, méthode. ]]
+function M.paste_into_comp(comp, setting_text, insert_before_output, tools_path, delta)
+  local specs = M.load_tools(tools_path)
+  local main = specs and specs[1] and specs[1].name
+  local function count_main()
+    if not main then return 0 end
+    local n = 0
+    for _, t in pairs(comp:GetToolList(false) or {}) do
+      local nm = t.Name or ""
+      if nm == main or nm:find("^" .. main .. "_%d+$") then n = n + 1 end
+    end
+    return n
+  end
+  local before = count_main()
   comp:Lock()
   comp:StartUndo("TAPNext++")
-  local ok = comp:Paste(data)
-  local msg = "Nœud ajouté dans la comp Fusion."
-  if ok and insert_before_output then
-    local tool
-    for _, t in pairs(comp:GetToolList(true) or {}) do
-      local nm = t.Name or ""
-      if nm:find("^TAP_Stabilize") then tool = t end
+  local how, err = nil, nil
+  local data = setting_text and bmd.readstring(setting_text)
+  if data then
+    local okp, res = pcall(function() return comp:Paste(data) end)
+    if okp and res and (not main or count_main() > before) then how = "collage" end
+    err = okp and "comp:Paste refusé" or tostring(res)
+  else
+    err = "fichier .setting illisible"
+  end
+  local tool
+  if not how and not specs then err = err .. ", fichier _tools.lua absent" end
+  if not how and specs then
+    local okb, made = pcall(M.build_tools, comp, specs, delta or 0)
+    if okb then
+      how, tool = "api", made[1]
+    else
+      err = tostring(made)
     end
-    local mo = (comp:GetToolList(false, "MediaOut") or {})[1]
-    if tool and mo then
-      local src = mo.Input and mo.Input:GetConnectedOutput()
-      if src then
-        tool:ConnectInput("Input", src:GetTool())
-      else
-        local mi = (comp:GetToolList(false, "MediaIn") or {})[1]
-        if mi then tool:ConnectInput("Input", mi) end
+  end
+  local msg = how and "Nœud ajouté dans la comp Fusion." or ("échec : " .. tostring(err))
+  if how and insert_before_output then
+    if not tool then
+      for _, t in pairs(comp:GetToolList(true) or {}) do
+        if (t.Name or ""):find("^TAP_Stabilize") then tool = t end
       end
-      mo:ConnectInput("Input", tool)
-      msg = "Stabilisation branchée avant " .. (mo.Name or "MediaOut") .. " : l'image est stabilisée."
     end
+    msg = M.wire_before_output(comp, tool) or msg
   end
   comp:EndUndo(true)
   comp:Unlock()
-  return ok and true or false, msg
+  return how ~= nil, msg, how
 end
 
 -- ------------------------------------------------------------- Resolve : accès
@@ -438,10 +532,13 @@ function M.import_results(resolve, root, job_text, done_text)
   }
   local matte = M.json_field(done_text, "matte")
   if matte and matte ~= "" then
-    if M.import_to_bin(resolve, matte) then
-      report[#report + 1] = "✔ Matte importée dans le Media Pool, chutier « TAPNext »."
+    local okm, why = M.import_to_bin(resolve, matte)
+    if okm then
+      report[#report + 1] = "✔ Matte dans le Media Pool, chutier « TAPNext »" ..
+        (why and (" (" .. why .. ")") or "") .. "."
     else
-      report[#report + 1] = "✘ Import de la matte dans le Media Pool impossible."
+      report[#report + 1] = "✘ Import de la matte dans le Media Pool impossible (" .. tostring(why) ..
+        ") : glissez le fichier ci-dessous dans le Media Pool."
     end
     if M.json_field(done_text, "attach") ~= "false" and M.attach_matte(resolve, ctx, matte) then
       report[#report + 1] = "✔ Matte aussi attachée au clip (page Color → clic droit → Add Matte)."
@@ -453,10 +550,11 @@ function M.import_results(resolve, root, job_text, done_text)
   end
   local depth = M.json_field(done_text, "depth_video")
   if depth and depth ~= "" then
-    if M.import_to_bin(resolve, depth) then
-      report[#report + 1] = "✔ Vidéo de profondeur (blanc = proche) importée dans le chutier « TAPNext »."
+    local okd, why = M.import_to_bin(resolve, depth)
+    if okd then
+      report[#report + 1] = "✔ Vidéo de profondeur (blanc = proche) dans le chutier « TAPNext »."
     else
-      report[#report + 1] = "✘ Import de la vidéo de profondeur impossible : " .. depth
+      report[#report + 1] = "✘ Import de la vidéo de profondeur impossible (" .. tostring(why) .. ") : " .. depth
     end
   end
   local tapfx = M.json_field(done_text, "tapfx")
@@ -480,11 +578,14 @@ function M.import_results(resolve, root, job_text, done_text)
       for _, w in ipairs(wanted) do
         local md, file = w[1], w[2]
         local text = M.shift_setting(M.read_all(file), rstart)
-        if text and text ~= "" then
+        local tools = file:gsub("%.setting$", "_tools.lua")
+        if (text and text ~= "") or M.exists(tools) then
           local insert = (md == "stabilize") and wire
-          local ok, msg = M.paste_into_comp(comp, text, insert)
+          local ok, msg, how = M.paste_into_comp(comp, text, insert, tools, rstart)
+          M.log(root, "Nœud " .. md .. " : " .. tostring(how) .. " · " .. tostring(msg))
           if ok and not insert then msg = "Nœud " .. labels[md] .. " ajouté (à brancher)." end
-          report[#report + 1] = ok and ("✔ " .. msg) or ("✘ Collage impossible : " .. labels[md])
+          report[#report + 1] = ok and ("✔ " .. msg) or
+            ("✘ Ajout impossible : " .. labels[md] .. " (" .. tostring(msg) .. ")")
         else
           report[#report + 1] = "✘ Nœud " .. labels[md] .. " illisible."
         end

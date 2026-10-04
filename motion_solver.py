@@ -325,11 +325,18 @@ def write_setting(path: str, kind: str, M: np.ndarray, W: int, Hh: int,
     """kind : 'transform' (similitude) ou 'corner' (perspective)."""
     if kind == "corner":
         q = quad if quad is not None else np.array([[0, 0], [W, 0], [W, Hh], [0, Hh]], float)
-        blocks = _corner_tool(name or "TAP_CornerPin", corner_keys(M, q, W, Hh, frames, offset), (0, 0))
+        ck = corner_keys(M, q, W, Hh, frames, offset)
+        blocks = _corner_tool(name or "TAP_CornerPin", ck, (0, 0))
         text = "{\n\tTools = ordered() {\n" + "\n".join(blocks) + \
             '\n\t},\n\tActiveTool = "%s"\n}\n' % (name or "TAP_CornerPin")
+        spec = dict(name=name or "TAP_CornerPin", type="CornerPositioner", points=ck)
     else:
-        text = fx.build_setting({name or "TAP_Transform": transform_keys(M, W, Hh, frames, offset)})
+        tk = transform_keys(M, W, Hh, frames, offset)
+        text = fx.build_setting({name or "TAP_Transform": tk})
+        spec = dict(name=name or "TAP_Transform", type="Transform",
+                    static={"Pivot": (0.5, 0.5)}, points={"Center": tk["Center"]},
+                    numbers={"Angle": tk["Angle"], "Size": tk["Size"]})
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
+    fx.write_tools_lua(path, [spec])
     return text

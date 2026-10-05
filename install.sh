@@ -39,7 +39,7 @@ else
 fi
 
 echo "[4/9] OpenCV, ffmpeg, interface Qt et dépendances…"
-"$UV" pip install --python "$PY" opencv-python numpy einops tqdm imageio-ffmpeg PySide6-Essentials scipy transformers
+"$UV" pip install --python "$PY" opencv-python numpy einops tqdm imageio-ffmpeg PySide6-Essentials scipy
 
 echo "[5/9] TAPNext++ (google-deepmind/tapnet)…"
 "$UV" pip install --python "$PY" --no-deps --reinstall-package tapnet \
@@ -50,7 +50,7 @@ echo "[6/9] Modèle TAPNext++ 512 px (~2,5 Go, une seule fois)…"
 "$PY" -c "import tap_resolve_tool as t; print('      ', t.ensure_checkpoint(None, 512))"
 
 echo "[7/9] Vérification…"
-"$PY" -c "import PySide6, torch, cv2, imageio_ffmpeg, scipy, transformers; from tapnet.tapnextpp.votsp2026.model import TAPNextPP; c=torch.cuda.is_available(); print('       PyTorch', torch.__version__, '| CUDA :', c, '|', torch.cuda.get_device_name(0) if c else 'CPU'); print('       OpenCV', cv2.__version__, '| ffmpeg OK | Qt OK | 3D OK | TAPNext++ OK')"
+"$PY" -c "import PySide6, torch, cv2, imageio_ffmpeg, scipy; from tapnet.tapnextpp.votsp2026.model import TAPNextPP; c=torch.cuda.is_available(); print('       PyTorch', torch.__version__, '| CUDA :', c, '|', torch.cuda.get_device_name(0) if c else 'CPU'); print('       OpenCV', cv2.__version__, '| ffmpeg OK | Qt OK | TAPNext++ OK')"
 echo "[8/9] Intégration dans DaVinci Resolve (Workspace > Scripts)…"
 "$PY" resolve_plugin/install_resolve_plugin.py || echo "      ATTENTION : intégration Resolve impossible, voir README."
 echo "[9/9] Effet OFX « TAPNext Shapes »…"

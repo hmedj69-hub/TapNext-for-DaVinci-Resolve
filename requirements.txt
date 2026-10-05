@@ -8,7 +8,6 @@ einops
 tqdm
 imageio-ffmpeg
 PySide6-Essentials
-scipy            # solveur de caméra 3D
-transformers     # profondeur (Depth Anything V2)
+scipy            # stabilisation (trajectoire cinéma)
 # TAPNext++ (non publié sur PyPI). Installez-le sans dépendances pour éviter JAX/TensorFlow :
 #   pip install --no-deps "tapnet @ git+https://github.com/google-deepmind/tapnet.git"

@@ -10,6 +10,8 @@
 //   float32 pos[T][Q][2] (pixels source, NaN = absent) · float32 vis[T][Q]
 //   uint8 valid[T][Q] (suivi et non coupé) · int32 group[Q]
 //   version 2 ("TAPFX02") : + float32 depth[T][Q] (0 = proche, 1 = loin, NaN = inconnue)
+//   version 3 ("TAPFX03") : + float32 affine[T][Q][4] (déformation locale de la surface,
+//                            déduite du suivi : perspective et profondeur des formes)
 //
 // Licence : MIT (code TAPNext) ; en-têtes OpenFX sous licence BSD.
 
@@ -75,7 +77,8 @@ enum ShapeKind { kCircle, kSquare, kRounded, kDiamond, kTriangle, kHexagon, kSta
 const char* kShapeLabels[] = {"Cercle", "Carré", "Carré arrondi", "Losange", "Triangle",
                               "Hexagone", "Étoile", "Croix", "Anneau", "Image (PNG)"};
 const char* kOutputLabels[] = {"Image + alpha (pour la page Color)", "Matte N&B",
-                               "Aperçu (formes sur l'image)"};
+                               "Aperçu (formes sur l'image)", "Rush masqué + effets"};
+const char* kBgLabels[] = {"Transparent (alpha)", "Noir", "Rush original", "Rush assombri"};
 
 struct Params {
   std::string file;
@@ -95,6 +98,9 @@ struct Params {
   bool invert = true;
   bool showPoints = false;
   double shapeW = 1.0, shapeH = 1.0;     // largeur / hauteur (× taille)
+  bool perspOn = false;                  // épouser la surface (perspective du suivi)
+  double persp = 1.0;
+  int background = 0;                    // rush masqué : 0 transparent, 1 noir, 2 original, 3 assombri
   // profondeur
   double depthScale = 0.0, depthNear = 0.0, depthFar = 1.0, depthFeather = 0.05, depthFog = 0.0;
   // ombre portée
@@ -106,7 +112,7 @@ struct Params {
 };
 enum EchoMode { kEchoNone, kEcho, kSlitH, kSlitV, kSlitRadial, kSlitDepth };
 const char* kEchoLabels[] = {"Aucun", "Écho (copies dans le temps)", "Slit-scan horizontal",
-                             "Slit-scan vertical", "Slit-scan radial", "Time-slice selon la profondeur"};
+                             "Slit-scan vertical", "Slit-scan radial", "Time-slice selon la profondeur (suivi)"};
 
 // ---------------------------------------------------------------------------
 // Fichiers (chemins UTF-8, y compris sous Windows : accents, etc.)
@@ -148,7 +154,8 @@ struct TrackFile {
   std::vector<float> pos, vis;
   std::vector<uint8_t> valid;
   std::vector<int32_t> group;
-  std::vector<float> depth;  // vide si fichier v1
+  std::vector<float> depth;   // vide si fichier v1
+  std::vector<float> affine;  // T*Q*4 (vide avant v3)
 };
 
 bool loadTrackFile(const std::string& path, TrackFile& tf) {
@@ -171,6 +178,10 @@ bool loadTrackFile(const std::string& path, TrackFile& tf) {
     tf.depth.resize(n);
     if (!readAll(f.get(), tf.depth.data(), n * 4)) tf.depth.clear();
   }
+  if (ok && version >= 3 && !tf.depth.empty()) {
+    tf.affine.resize(n * 4);
+    if (!readAll(f.get(), tf.affine.data(), n * 16)) tf.affine.clear();
+  }
   return ok;
 }
 
@@ -183,6 +194,7 @@ struct Prepared {
   std::vector<float> dir;    // T*n*2
   std::vector<float> jit;    // n
   std::vector<float> depth;  // T*n (vide si pas de profondeur)
+  std::vector<float> affine; // T*n*4 (vide si pas de perspective)
 };
 
 inline bool finite(float v) { return std::isfinite(v); }
@@ -294,6 +306,16 @@ void prepare(const TrackFile& tf, const Params& p, Prepared& out) {
       for (int t = 0; t < T && !finite(out.depth[size_t(t) * n + j]); ++t) out.depth[size_t(t) * n + j] = firstv;
     }
   }
+  // 3c) perspective : déformation locale (déjà complétée par Studio)
+  if (!tf.affine.empty()) {
+    out.affine.resize(size_t(T) * n * 4);
+    for (int t = 0; t < T; ++t)
+      for (int j = 0; j < n; ++j)
+        for (int c = 0; c < 4; ++c) {
+          float v = tf.affine[(size_t(t) * tf.Q + cols[j]) * 4 + c];
+          out.affine[(size_t(t) * n + j) * 4 + c] = finite(v) ? v : (c == 0 || c == 3 ? 1.f : 0.f);
+        }
+  }
   // 4) variation de taille déterministe par point
   out.jit.resize(n);
   for (int j = 0; j < n; ++j) {
@@ -397,21 +419,24 @@ struct Canvas {
   void init(int W, int H) { w = W; h = H; v.assign(size_t(W) * H, 0.f); }
 };
 
-void drawShape(Canvas& c, const Params& p, const Stamp* stamp, float cx, float cy, float sx,
-               float sy, float angDeg, float value) {
-  const float ang = angDeg * float(kPi) / 180.f;
-  const float ca = std::cos(ang), sa = std::sin(ang);
-  const float R = std::max(sx, sy) * 1.3f + 2.f;
+// M = matrice 2×2 forme unitaire → pixels (taille, rotation, étirement, perspective).
+void drawShape(Canvas& c, const Params& p, const Stamp* stamp, float cx, float cy, const float* M,
+               float value) {
+  const float det = M[0] * M[3] - M[1] * M[2];
+  if (std::fabs(det) < 1e-6f) return;
+  const float i00 = M[3] / det, i01 = -M[1] / det, i10 = -M[2] / det, i11 = M[0] / det;
+  const float R = std::sqrt(M[0] * M[0] + M[1] * M[1] + M[2] * M[2] + M[3] * M[3]) * 1.3f + 2.f;
   const int x0 = std::max(0, int(cx - R)), x1 = std::min(c.w - 1, int(cx + R));
   const int y0 = std::max(0, int(cy - R)), y1 = std::min(c.h - 1, int(cy + R));
-  const float scale = std::max(0.5f, std::min(sx, sy));
-  const bool aniso = std::fabs(sx - sy) > 0.05f * std::max(sx, sy);
+  const float scale = std::max(0.5f, std::sqrt(std::fabs(det)));
+  // similitude (rotation + échelle uniforme) ou forme déformée ?
+  const bool aniso = std::fabs(M[0] - M[3]) + std::fabs(M[1] + M[2]) > 0.05f * (std::fabs(M[0]) + std::fabs(M[1]) + std::fabs(M[2]) + std::fabs(M[3]));
   for (int y = y0; y <= y1; ++y) {
     float* row = &c.v[size_t(y) * c.w];
     for (int x = x0; x <= x1; ++x) {
       float dx = x + 0.5f - cx, dy = y + 0.5f - cy;
-      float lx = (ca * dx + sa * dy) / sx;   // rotation inverse puis échelle
-      float ly = (-sa * dx + ca * dy) / sy;
+      float lx = i00 * dx + i01 * dy;
+      float ly = i10 * dx + i11 * dy;
       float cov;
       if (p.shape == kImage && stamp && stamp->w > 0) {
         float u = (lx * 0.5f + 0.5f) * (stamp->w - 1), vv = (ly * 0.5f + 0.5f) * (stamp->h - 1);
@@ -428,8 +453,8 @@ void drawShape(Canvas& c, const Params& p, const Stamp* stamp, float cx, float c
         if (aniso) {
           // Forme étirée : distance en pixels via le gradient (bords nets partout).
           const float e = 0.5f;
-          float gx = (shapeSdf(kind, (ca * (dx + e) + sa * dy) / sx, (-sa * (dx + e) + ca * dy) / sy) - d) / e;
-          float gy = (shapeSdf(kind, (ca * dx + sa * (dy + e)) / sx, (-sa * dx + ca * (dy + e)) / sy) - d) / e;
+          float gx = (shapeSdf(kind, lx + i00 * e, ly + i10 * e) - d) / e;
+          float gy = (shapeSdf(kind, lx + i01 * e, ly + i11 * e) - d) / e;
           float g = std::sqrt(gx * gx + gy * gy);
           d = g > 1e-6f ? d / g : d * scale;
         } else {
@@ -492,7 +517,8 @@ void renderCore(const TrackFile& tf, const Prepared& pr, const Params& p, const 
   const float vnorm = 1080.f / tf.H;
   const float base = std::max(0.5f, float(p.size) * rs * scale);
   const bool hasDepth = !pr.depth.empty();
-  struct S { float cx, cy, sx, sy, ang, al; };
+  struct S { float cx, cy, m[4], al; };
+  const bool usePersp = p.perspOn && !pr.affine.empty();
   std::vector<S> st;
   const int trail = std::max(0, p.trail);
   const float ca = std::cos(float(p.shadowAngle * kPi / 180)), sa = std::sin(float(p.shadowAngle * kPi / 180));
@@ -535,8 +561,20 @@ void renderCore(const TrackFile& tf, const Prepared& pr, const Params& p, const 
         if (p.shadowDepth && finite(d)) dist *= 0.25f + 1.5f * (1.f - d);
         cx += ca * dist; cy += sa * dist;
       }
-      st.push_back({cx, cy, std::max(0.5f, r * s * float(p.shapeW)), std::max(0.5f, r * float(p.shapeH)),
-                    ang, al * (k ? fade : 1.f)});
+      {
+        const float sxx = std::max(0.5f, r * s * float(p.shapeW)), syy = std::max(0.5f, r * float(p.shapeH));
+        const float ra = ang * float(kPi) / 180.f, cr = std::cos(ra), sr = std::sin(ra);
+        S e{cx, cy, {cr * sxx, -sr * syy, sr * sxx, cr * syy}, al * (k ? fade : 1.f)};
+        if (usePersp) {
+          const float* A = &pr.affine[i * 4];
+          const float am = float(p.persp);
+          const float P0 = 1 + am * (A[0] - 1), P1 = am * A[1], P2 = am * A[2], P3 = 1 + am * (A[3] - 1);
+          const float m0 = e.m[0], m1 = e.m[1], m2 = e.m[2], m3 = e.m[3];
+          e.m[0] = P0 * m0 + P1 * m2; e.m[1] = P0 * m1 + P1 * m3;
+          e.m[2] = P2 * m0 + P3 * m2; e.m[3] = P2 * m1 + P3 * m3;
+        }
+        st.push_back(e);
+      }
     }
   }
   Canvas m;
@@ -545,9 +583,10 @@ void renderCore(const TrackFile& tf, const Prepared& pr, const Params& p, const 
     Canvas amap, cover;
     amap.init(ww, wh); cover.init(ww, wh);
     for (auto& s : st) {
-      drawShape(m, p, stamp, s.cx, s.cy, s.sx, s.sy, s.ang, 1.f);
-      drawShape(amap, p, stamp, s.cx, s.cy, s.sx * 1.5f, s.sy * 1.5f, s.ang, s.al);
-      drawShape(cover, p, stamp, s.cx, s.cy, s.sx * 1.5f, s.sy * 1.5f, s.ang, 1.f);
+      const float big[4] = {s.m[0] * 1.5f, s.m[1] * 1.5f, s.m[2] * 1.5f, s.m[3] * 1.5f};
+      drawShape(m, p, stamp, s.cx, s.cy, s.m, 1.f);
+      drawShape(amap, p, stamp, s.cx, s.cy, big, s.al);
+      drawShape(cover, p, stamp, s.cx, s.cy, big, 1.f);
     }
     double sigma = p.merge * base;
     gaussBlur(m, sigma); gaussBlur(amap, sigma); gaussBlur(cover, sigma);
@@ -560,7 +599,7 @@ void renderCore(const TrackFile& tf, const Prepared& pr, const Params& p, const 
       m.v[i] = v * op;
     }
   } else {
-    for (auto& s : st) drawShape(m, p, stamp, s.cx, s.cy, s.sx, s.sy, s.ang, s.al);
+    for (auto& s : st) drawShape(m, p, stamp, s.cx, s.cy, s.m, s.al);
     gaussBlur(m, p.softness * base * 2.0);
   }
   out.swap(m.v);
@@ -759,7 +798,7 @@ const char* kParamNames[] = {"file", "group", "offset", "output", "showPoints", 
                              "size", "shapeW", "shapeH", "opacity", "rotation", "follow", "jitter", "grow", "stretch",
                              "maxScale", "always", "fadeInOn", "fadeIn", "fadeOutOn", "fadeOut",
                              "merge", "threshold", "softness", "trail", "smooth", "invert",
-                             "depthScale", "depthNear", "depthFar", "depthFeather", "depthFog",
+                             "perspOn", "persp", "background",
                              "shadowOn", "shadowAngle", "shadowDist", "shadowSoft", "shadowOpacity",
                              "shadowDepth", "echoMode", "echoCount", "echoStep", "echoDecay",
                              "echoScale", "slitSpan"};
@@ -774,7 +813,8 @@ void describeParams(OfxImageEffectHandle desc) {
          "Numéro du groupe de points de Studio (0 = tous les points)");
   defInt(ps, "offset", "Décalage d'image", 0, -100000, 100000, "gData",
          "À ajuster si les formes sont en avance ou en retard sur l'image");
-  defChoice(ps, "output", "Sortie", kOutputLabels, 3, 0, "gData");
+  defChoice(ps, "output", "Sortie", kOutputLabels, 4, 0, "gData");
+  defChoice(ps, "background", "Fond du rush masqué", kBgLabels, 4, 0, "gData");
   defBool(ps, "showPoints", "Afficher les points (aperçu)", false, "gData");
 
   defGroup(ps, "gShape", "Forme");
@@ -790,6 +830,9 @@ void describeParams(OfxImageEffectHandle desc) {
   defDouble(ps, "rotation", "Rotation (°)", 0.0, -180.0, 180.0, "gShape");
   defBool(ps, "follow", "Orienter dans le sens du mouvement", false, "gShape");
   defDouble(ps, "jitter", "Variation aléatoire de taille", 0.0, 0.0, 1.0, "gShape");
+  defBool(ps, "perspOn", "Épouser la perspective de la surface", false, "gShape",
+          "Les formes se déforment et changent de taille comme la surface suivie (déduit du suivi TAPNext)");
+  defDouble(ps, "persp", "Intensité de la perspective", 1.0, 0.0, 1.0, "gShape");
 
   defGroup(ps, "gMotion", "Réaction au mouvement");
   defDouble(ps, "grow", "Grossir avec la vitesse", 0.1, 0.0, 1.0, "gMotion");
@@ -814,21 +857,13 @@ void describeParams(OfxImageEffectHandle desc) {
   defDouble(ps, "smooth", "Lissage des trajectoires", 2.1, 0.0, 5.0, "gFx");
   defBool(ps, "invert", "Inverser la matte", true, "gFx");
 
-  defGroup(ps, "gDepth", "Profondeur (tracker 3D)", false);
-  defDouble(ps, "depthScale", "Taille selon la profondeur", 0.0, 0.0, 1.0, "gDepth",
-            "Proches plus gros, lointains plus petits (perspective)");
-  defDouble(ps, "depthNear", "Profondeur min. (0 = proche)", 0.0, 0.0, 1.0, "gDepth");
-  defDouble(ps, "depthFar", "Profondeur max. (1 = loin)", 1.0, 0.0, 1.0, "gDepth");
-  defDouble(ps, "depthFeather", "Fondu de la plage", 0.05, 0.0, 0.5, "gDepth");
-  defDouble(ps, "depthFog", "Brume (opacité selon distance)", 0.0, 0.0, 1.0, "gDepth");
-
   defGroup(ps, "gShadow", "Ombre portée", false);
   defBool(ps, "shadowOn", "Ombre portée", false, "gShadow");
   defDouble(ps, "shadowAngle", "Direction (°)", 135.0, -180.0, 360.0, "gShadow");
   defDouble(ps, "shadowDist", "Distance (px)", 12.0, 0.0, 400.0, "gShadow");
   defDouble(ps, "shadowSoft", "Flou (px)", 6.0, 0.0, 100.0, "gShadow");
   defDouble(ps, "shadowOpacity", "Opacité", 0.6, 0.0, 1.0, "gShadow");
-  defBool(ps, "shadowDepth", "Distance selon la profondeur", false, "gShadow");
+  defBool(ps, "shadowDepth", "Distance selon la profondeur (suivi)", false, "gShadow");
 
   defGroup(ps, "gEcho", "Écho temporel / slit-scan", false);
   defChoice(ps, "echoMode", "Mode", kEchoLabels, 6, kEchoNone, "gEcho");
@@ -853,8 +888,7 @@ Params readParams(Instance* in, OfxTime t) {
   B("fadeOutOn", p.fadeOutOn); I("fadeOut", p.fadeOut); D("merge", p.merge);
   D("threshold", p.threshold); D("softness", p.softness); I("trail", p.trail);
   D("smooth", p.smooth); B("invert", p.invert);
-  D("depthScale", p.depthScale); D("depthNear", p.depthNear); D("depthFar", p.depthFar);
-  D("depthFeather", p.depthFeather); D("depthFog", p.depthFog);
+  B("perspOn", p.perspOn); D("persp", p.persp); I("background", p.background);
   B("shadowOn", p.shadowOn); D("shadowAngle", p.shadowAngle); D("shadowDist", p.shadowDist);
   D("shadowSoft", p.shadowSoft); D("shadowOpacity", p.shadowOpacity); B("shadowDepth", p.shadowDepth);
   I("echoMode", p.echoMode); I("echoCount", p.echoCount); I("echoStep", p.echoStep);
@@ -893,7 +927,7 @@ OfxStatus describe(OfxImageEffectHandle desc) {
   gProp->propSetInt(props, kOfxImageEffectPluginPropSingleInstance, 0, 0);
   gProp->propSetString(props, kOfxImageEffectPluginRenderThreadSafety, 0, kOfxImageEffectRenderFullySafe);
   gProp->propSetInt(props, kOfxImageEffectPluginPropHostFrameThreading, 0, 0);
-  gProp->propSetInt(props, kOfxImageEffectPropTemporalClipAccess, 0, 0);
+  gProp->propSetInt(props, kOfxImageEffectPropTemporalClipAccess, 0, 1);  // rush masqué + échos
   return kOfxStatOK;
 }
 
@@ -901,6 +935,7 @@ OfxStatus describeInContext(OfxImageEffectHandle desc) {
   OfxPropertySetHandle props;
   gEffect->clipDefine(desc, kOfxImageEffectSimpleSourceClipName, &props);
   gProp->propSetString(props, kOfxImageEffectPropSupportedComponents, 0, kOfxImageComponentRGBA);
+  gProp->propSetInt(props, kOfxImageEffectPropTemporalClipAccess, 0, 1);
   gEffect->clipDefine(desc, kOfxImageEffectOutputClipName, &props);
   gProp->propSetString(props, kOfxImageEffectPropSupportedComponents, 0, kOfxImageComponentRGBA);
   describeParams(desc);
@@ -1012,6 +1047,224 @@ ImageRef imageRef(OfxPropertySetHandle img) {
   return r;
 }
 
+// ---------------------------------------------------------------------------
+// Rush masqué + effets : l'image d'origine dans les formes, échos / slit-scan /
+// ombre appliqués à cette image (images voisines lues dans le clip).
+// ---------------------------------------------------------------------------
+template <class T>
+void toBuf(const ImageRef& im, const OfxRectI& win, std::vector<float>& out) {
+  const int ww = win.x2 - win.x1, wh = win.y2 - win.y1;
+  out.assign(size_t(ww) * wh * 4, 0.f);
+  for (int y = std::max(win.y1, im.b.y1); y < std::min(win.y2, im.b.y2); ++y) {
+    const T* row = reinterpret_cast<const T*>(static_cast<const char*>(im.data) + size_t(y - im.b.y1) * im.rowBytes);
+    float* o = &out[(size_t(y - win.y1) * ww) * 4];
+    for (int x = std::max(win.x1, im.b.x1); x < std::min(win.x2, im.b.x2); ++x) {
+      const T* sp = row + size_t(x - im.b.x1) * 4;
+      float* op = o + size_t(x - win.x1) * 4;
+      op[0] = toF(sp[0]); op[1] = toF(sp[1]); op[2] = toF(sp[2]); op[3] = toF(sp[3]);
+    }
+  }
+}
+
+template <class T>
+void fromBuf(const ImageRef& dst, const OfxRectI& win, const std::vector<float>& in) {
+  const int ww = win.x2 - win.x1;
+  for (int y = std::max(win.y1, dst.b.y1); y < std::min(win.y2, dst.b.y2); ++y) {
+    T* row = reinterpret_cast<T*>(static_cast<char*>(dst.data) + size_t(y - dst.b.y1) * dst.rowBytes);
+    const float* ip = &in[(size_t(y - win.y1) * ww) * 4];
+    for (int x = std::max(win.x1, dst.b.x1); x < std::min(win.x2, dst.b.x2); ++x) {
+      T* d = row + size_t(x - dst.b.x1) * 4;
+      const float* sp = ip + size_t(x - win.x1) * 4;
+      d[0] = fromF<T>(sp[0]); d[1] = fromF<T>(sp[1]); d[2] = fromF<T>(sp[2]); d[3] = fromF<T>(sp[3]);
+    }
+  }
+}
+
+bool fetchSrc(OfxImageClipHandle clip, OfxTime tt, const OfxRectI& win, std::vector<float>& out) {
+  OfxPropertySetHandle img = nullptr;
+  if (gEffect->clipGetImage(clip, tt, nullptr, &img) != kOfxStatOK || !img) return false;
+  ImageRef r = imageRef(img);
+  char* dep = nullptr;
+  gProp->propGetString(img, kOfxImageEffectPropPixelDepth, 0, &dep);
+  std::string d = dep ? dep : "";
+  if (r.data) {
+    if (d == kOfxBitDepthFloat) toBuf<float>(r, win, out);
+    else if (d == kOfxBitDepthShort) toBuf<uint16_t>(r, win, out);
+    else toBuf<uint8_t>(r, win, out);
+  }
+  gEffect->clipReleaseImage(img);
+  return r.data != nullptr;
+}
+
+int framesBackOf(const Params& p) {
+  if (p.output != 3) return 0;
+  if (p.echoMode == kEcho) return std::min(240, std::max(0, p.echoCount) * std::max(1, p.echoStep));
+  if (p.echoMode == kSlitH || p.echoMode == kSlitV || p.echoMode == kSlitRadial) return std::min(240, std::max(1, p.slitSpan));
+  return 0;
+}
+
+void renderComposite(OfxImageClipHandle srcClip, const TrackFile& tf, const Prepared& pr, const Params& p,
+                     const Stamp* stamp, OfxTime time, int t, int ww, int wh, const OfxRectI& win,
+                     double fx0, double fy0, double fw, double fh, std::vector<float>& col) {
+  const int W = std::max(1, win.x2 - win.x1), H = std::max(1, win.y2 - win.y1);
+  const size_t np = size_t(W) * H;
+  // fenêtre → matte de travail (bilinéaire)
+  std::vector<int> ix0(W), ix1(W), iy0(H), iy1(H);
+  std::vector<float> ax(W), ay(H), xn(W), yn(H);
+  for (int x = 0; x < W; ++x) {
+    xn[x] = float(((win.x1 + x + 0.5) - fx0) / fw);
+    float mx = xn[x] * ww - 0.5f;
+    int i = int(std::floor(mx));
+    ax[x] = mx - i;
+    ix0[x] = std::max(0, std::min(ww - 1, i)); ix1[x] = std::max(0, std::min(ww - 1, i + 1));
+  }
+  for (int y = 0; y < H; ++y) {
+    yn[y] = float(1.0 - ((win.y1 + y + 0.5) - fy0) / fh);   // 0 = haut
+    float my = yn[y] * wh - 0.5f;
+    int i = int(std::floor(my));
+    ay[y] = my - i;
+    iy0[y] = std::max(0, std::min(wh - 1, i)); iy1[y] = std::max(0, std::min(wh - 1, i + 1));
+  }
+  auto sampleAll = [&](const std::vector<float>& m, std::vector<float>& out) {
+    out.resize(np);
+    for (int y = 0; y < H; ++y) {
+      const float* r0 = &m[size_t(iy0[y]) * ww];
+      const float* r1 = &m[size_t(iy1[y]) * ww];
+      for (int x = 0; x < W; ++x) {
+        float v = (r0[ix0[x]] * (1 - ax[x]) + r0[ix1[x]] * ax[x]) * (1 - ay[y]) +
+                  (r1[ix0[x]] * (1 - ax[x]) + r1[ix1[x]] * ax[x]) * ay[y];
+        bool in = xn[x] >= 0 && xn[x] <= 1 && yn[y] >= 0 && yn[y] <= 1;
+        out[size_t(y) * W + x] = in ? v : 0.f;
+      }
+    }
+  };
+  const float op = float(p.opacity);
+  auto base = [&](int tk, float sc, std::vector<float>& m) {
+    renderCore(tf, pr, p, stamp, tk, ww, wh, sc, false, m);
+    for (auto& v : m) v *= op;
+  };
+  std::vector<float> cur;
+  if (!fetchSrc(srcClip, time, win, cur)) cur.assign(np * 4, 0.f);
+  col.assign(np * 4, 0.f);
+  if (p.background == 2) col = cur;
+  else if (p.background == 3) for (size_t i = 0; i < np * 4; ++i) col[i] = cur[i] * 0.3f;
+  std::vector<float> alpha(np, 0.f);
+  auto over = [&](const std::vector<float>& src, const std::vector<float>& a) {
+    for (size_t i = 0; i < np; ++i) {
+      float m = a[i];
+      if (m <= 0) continue;
+      for (int c = 0; c < 3; ++c) col[i * 4 + c] = col[i * 4 + c] * (1 - m) + src[i * 4 + c] * m;
+      alpha[i] = std::max(alpha[i], m);
+    }
+  };
+  std::vector<float> mw, ms;                  // matte de travail / matte fenêtre
+  std::vector<float> fxWork;                  // forme qui projette l'ombre
+  std::vector<std::pair<std::vector<float>, std::vector<float>>> echoes;
+  std::vector<float> mNow, cNow = cur;
+  const bool slit = p.echoMode == kSlitH || p.echoMode == kSlitV || p.echoMode == kSlitRadial;
+  if (p.echoMode == kEcho) {
+    base(t, 1.f, mw);
+    fxWork = mw;
+    sampleAll(mw, mNow);
+    for (int k = std::max(0, p.echoCount); k >= 1; --k) {
+      int dk = k * std::max(1, p.echoStep);
+      if (t - dk < 0) continue;
+      std::vector<float> img;
+      if (!fetchSrc(srcClip, time - dk, win, img)) continue;
+      std::vector<float> mk;
+      base(t - dk, float(std::pow(p.echoScale, k)), mk);
+      const float dec = float(std::pow(p.echoDecay, k));
+      for (size_t i = 0; i < mk.size(); ++i) { mk[i] *= dec; fxWork[i] = std::max(fxWork[i], mk[i]); }
+      std::vector<float> mks;
+      sampleAll(mk, mks);
+      echoes.emplace_back(std::move(img), std::move(mks));
+    }
+  } else if (slit) {
+    const int span = std::max(1, p.slitSpan);
+    const int K = std::min(12, span + 1);
+    std::vector<float> U(np);
+    const float asp = float(fw / fh), rmax = std::sqrt(0.25f * asp * asp + 0.25f);
+    for (int y = 0; y < H; ++y)
+      for (int x = 0; x < W; ++x) {
+        float u = p.echoMode == kSlitH ? xn[x] : p.echoMode == kSlitV ? yn[y]
+                : std::sqrt((xn[x] - 0.5f) * (xn[x] - 0.5f) * asp * asp + (yn[y] - 0.5f) * (yn[y] - 0.5f)) / rmax;
+        U[size_t(y) * W + x] = std::min(1.f, std::max(0.f, u)) * (K - 1);
+      }
+    mNow.assign(np, 0.f);
+    cNow.assign(np * 4, 0.f);
+    for (int i = 0; i < K; ++i) {
+      int dk = int(std::lround(double(i) * span / (K - 1)));
+      int tk = std::max(0, t - dk);
+      std::vector<float> img;
+      const std::vector<float>* src = &cur;
+      if (dk > 0 && fetchSrc(srcClip, time - dk, win, img)) src = &img;
+      base(tk, 1.f, mw);
+      sampleAll(mw, ms);
+      for (size_t q = 0; q < np; ++q) {
+        float w = 1.f - std::fabs(U[q] - i);
+        if (w <= 0) continue;
+        float m = ms[q] * w;
+        mNow[q] += m;
+        for (int c = 0; c < 3; ++c) cNow[q * 4 + c] += (*src)[q * 4 + c] * m;
+      }
+    }
+    for (size_t q = 0; q < np; ++q)
+      for (int c = 0; c < 3; ++c) cNow[q * 4 + c] = mNow[q] > 1e-6f ? cNow[q * 4 + c] / mNow[q] : 0.f;
+    renderTimed(tf, pr, p, stamp, t, ww, wh, fxWork);
+    for (auto& v : fxWork) v *= op;
+  } else {
+    if (p.echoMode == kSlitDepth) renderTimed(tf, pr, p, stamp, t, ww, wh, mw);
+    else renderCore(tf, pr, p, stamp, t, ww, wh, 1.f, false, mw);
+    for (auto& v : mw) v *= op;
+    fxWork = mw;
+    sampleAll(mw, mNow);
+  }
+  if (p.shadowOn && p.shadowOpacity > 0) {
+    const float rs = float(ww) / tf.W;
+    Canvas sh;
+    sh.init(ww, wh);
+    float dist = float(p.shadowDist) * rs;
+    int dx = int(std::lround(std::cos(p.shadowAngle * kPi / 180) * dist));
+    int dy = int(std::lround(std::sin(p.shadowAngle * kPi / 180) * dist));
+    for (int y = 0; y < wh; ++y)
+      for (int x = 0; x < ww; ++x) {
+        int sx = x - dx, sy = y - dy;
+        if (sx >= 0 && sx < ww && sy >= 0 && sy < wh) sh.v[size_t(y) * ww + x] = fxWork[size_t(sy) * ww + sx];
+      }
+    gaussBlur(sh, p.shadowSoft * rs);
+    std::vector<float> shs;
+    sampleAll(sh.v, shs);
+    const float so = float(p.shadowOpacity);
+    for (size_t i = 0; i < np; ++i) {
+      float a = shs[i] * so;
+      for (int c = 0; c < 3; ++c) col[i * 4 + c] *= (1 - a);
+      alpha[i] = std::max(alpha[i], a);
+    }
+  }
+  for (auto& e : echoes) over(e.first, e.second);
+  over(cNow, mNow);
+  for (size_t i = 0; i < np; ++i) {
+    if (p.background == 0) {   // non prémultiplié, alpha = couverture
+      float a = alpha[i];
+      for (int c = 0; c < 3; ++c) col[i * 4 + c] = a > 1e-4f ? col[i * 4 + c] / a : 0.f;
+      col[i * 4 + 3] = a;
+    } else {
+      col[i * 4 + 3] = 1.f;
+    }
+  }
+}
+
+OfxStatus framesNeeded(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs, OfxPropertySetHandle outArgs) {
+  Instance* in = getInstance(effect);
+  if (!in) return kOfxStatReplyDefault;
+  OfxTime t = 0;
+  gProp->propGetDouble(inArgs, kOfxPropTime, 0, &t);
+  Params p = readParams(in, t);
+  double range[2] = {t - framesBackOf(p), t};
+  gProp->propSetDoubleN(outArgs, "OfxImageClipPropFrameRange_Source", 2, range);
+  return kOfxStatOK;
+}
+
 OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
   Instance* in = getInstance(effect);
   if (!in) return kOfxStatFailed;
@@ -1094,6 +1347,21 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
     ww = std::max(1, int(std::lround(fw * sc)));
     wh = std::max(1, int(std::lround(fh * sc)));
     int t = int(std::lround(time)) + p.offset - tf->first;
+    if (p.output == 3) {
+      std::vector<float> col;
+      if (t >= 0 && t < tf->T) {
+        renderComposite(in->src, *tf, *prep, p, stampImg.get(), time, t, ww, wh, win, fx0, fy0, fw, fh, col);
+      } else {
+        if (!fetchSrc(in->src, time, win, col)) col.assign(size_t(win.x2 - win.x1) * (win.y2 - win.y1) * 4, 0.f);
+      }
+      std::string dep2 = depth ? depth : "";
+      if (dep2 == kOfxBitDepthFloat) fromBuf<float>(dst, win, col);
+      else if (dep2 == kOfxBitDepthShort) fromBuf<uint16_t>(dst, win, col);
+      else fromBuf<uint8_t>(dst, win, col);
+      if (srcImg) gEffect->clipReleaseImage(srcImg);
+      gEffect->clipReleaseImage(outImg);
+      return kOfxStatOK;
+    }
     if (t >= 0 && t < tf->T) {
       renderMatte(*tf, *prep, p, stampImg.get(), t, ww, wh, matte);
       if (p.showPoints) {
@@ -1134,6 +1402,7 @@ OfxStatus mainEntry(const char* action, const void* handle, OfxPropertySetHandle
     if (!std::strcmp(action, kOfxActionDestroyInstance)) return destroyInstance(effect);
     if (!std::strcmp(action, kOfxImageEffectActionRender)) return render(effect, inArgs);
     if (!std::strcmp(action, kOfxImageEffectActionGetClipPreferences)) return getClipPreferences(outArgs);
+    if (!std::strcmp(action, kOfxImageEffectActionGetFramesNeeded)) return framesNeeded(effect, inArgs, outArgs);
   } catch (...) {
     return kOfxStatFailed;
   }
@@ -1144,12 +1413,7 @@ void setHost(OfxHost* h) { gHost = h; }
 
 OfxPlugin gPlugin = {kOfxImageEffectPluginApi, 1, kPluginId, 1, 0, setHost, mainEntry};
 
-// Second effet du même module : profondeur et temps appliqués à l'image.
-#include "TAPNextDepthTime.inc"
-
 }  // namespace
 
-TAP_EXPORT int OfxGetNumberOfPlugins(void) { return 2; }
-TAP_EXPORT OfxPlugin* OfxGetPlugin(int nth) {
-  return nth == 0 ? &gPlugin : nth == 1 ? &dt::gPlugin2 : nullptr;
-}
+TAP_EXPORT int OfxGetNumberOfPlugins(void) { return 1; }
+TAP_EXPORT OfxPlugin* OfxGetPlugin(int nth) { return nth == 0 ? &gPlugin : nullptr; }

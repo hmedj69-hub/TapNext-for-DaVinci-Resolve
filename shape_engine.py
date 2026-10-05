@@ -18,7 +18,7 @@ from __future__ import annotations
 import math
 import unicodedata
 from dataclasses import asdict, dataclass, fields
-from typing import Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence
 
 import cv2
 import numpy as np
@@ -31,7 +31,7 @@ ECHO_MODES = ["none", "echo", "slit_h", "slit_v", "slit_radial", "slit_depth"]
 ECHO_LABELS = {
     "none": "Aucun", "echo": "Écho (copies dans le temps)",
     "slit_h": "Slit-scan horizontal", "slit_v": "Slit-scan vertical",
-    "slit_radial": "Slit-scan radial", "slit_depth": "Time-slice selon la profondeur",
+    "slit_radial": "Slit-scan radial", "slit_depth": "Time-slice selon la profondeur (suivi)",
 }
 
 SHAPE_LABELS = {
@@ -51,6 +51,8 @@ class ShapeStyle:
     width: float = 1.0                # largeur (× taille) : rectangles, ellipses…
     height: float = 1.0               # hauteur (× taille)
     rotation: float = 0.0             # degrés
+    perspective: bool = False         # épouse la déformation locale de la surface (suivi TAPNext)
+    perspective_amount: float = 1.0   # 0 = forme rigide, 1 = suit entièrement la surface
     follow_motion: bool = False       # orientée dans le sens du mouvement
     opacity: float = 1.0
     size_jitter: float = 0.0          # variation aléatoire de taille (0..1)
@@ -71,7 +73,7 @@ class ShapeStyle:
     # --- effets
     trail: int = 0                    # traînée : nombre d'images
     smooth: float = 2.1               # lissage des trajectoires (images)
-    # --- profondeur (0 = proche, 1 = loin ; voir depth_engine / camera_solver)
+    # --- profondeur déduite du suivi (0 = proche, 1 = loin ; échelle locale de la surface)
     depth_scale: float = 0.0          # taille selon la profondeur (perspective)
     depth_near: float = 0.0           # plage de profondeur gardée
     depth_far: float = 1.0
@@ -119,9 +121,9 @@ PRESETS: Dict[str, dict] = {
                            echo_decay=0.65, echo_scale=0.92),
     "Slit-scan": dict(shape="circle", size=30, merge=0.6, threshold=0.5, softness=0.06,
                       grow=0.0, stretch=0.0, echo_mode="slit_h", slit_span=30, always_visible=True),
-    "Profondeur + ombre": dict(shape="circle", size=20, merge=0.0, softness=0.05, grow=0.0,
-                               stretch=0.0, depth_scale=0.8, depth_fog=0.4, shadow_on=True,
-                               shadow_depth=True, shadow_dist=18, shadow_soft=8, shadow_opacity=0.5),
+    "Perspective + ombre": dict(shape="square", size=16, merge=0.0, softness=0.0, grow=0.0,
+                                stretch=0.0, perspective=True, shadow_on=True, shadow_depth=True,
+                                shadow_dist=18, shadow_soft=8, shadow_opacity=0.5),
 }
 
 
@@ -190,7 +192,71 @@ class GroupData:
     direction: np.ndarray  # [T, n, 2]
     jitter: np.ndarray     # [n] facteur de taille
     ids: np.ndarray        # [n] indices des points (colonnes du suivi)
-    depth: Optional[np.ndarray] = None   # [T, n] profondeur 0..1 (0 = proche)
+    depth: Optional[np.ndarray] = None   # [T, n] profondeur 0..1 (0 = proche), déduite du suivi
+    affine: Optional[np.ndarray] = None  # [T, n, 2, 2] déformation locale de la surface
+
+
+def local_affine(pos: np.ndarray, ok: np.ndarray, ref: np.ndarray, k: int = 8,
+                 smooth: float = 2.0):
+    """Perspective et profondeur DÉDUITES DU SUIVI TAPNext : pour chaque point,
+    la déformation locale (matrice 2×2 : échelle, rotation, cisaillement de
+    perspective) que subissent ses voisins entre l'image où il a été posé et
+    chaque image. Une surface qui s'approche grandit, une surface qui tourne
+    se raccourcit dans un sens : les formes posées dessus font pareil.
+
+    pos [T, n, 2], ok [T, n], ref [n] image de pose → (A [T, n, 2, 2],
+    profondeur relative [T, n] 0 = proche … 1 = loin)."""
+    T, n = ok.shape
+    A = np.tile(np.eye(2, dtype=np.float32), (T, n, 1, 1))
+    if n < 4:
+        return A, None
+    P = np.nan_to_num(pos.astype(np.float64))
+    for j in range(n):
+        r = int(min(max(ref[j], 0), T - 1))
+        cand = np.nonzero(ok[r])[0]
+        cand = cand[cand != j]
+        if len(cand) < 3 or not ok[r, j]:
+            continue
+        d = np.linalg.norm(P[r, cand] - P[r, j], axis=1)
+        nb = cand[np.argsort(d)[:k]]
+        X = P[r, nb] - P[r, j]                                  # [k, 2]
+        Y = P[:, nb] - P[:, j:j + 1]                            # [T, k, 2]
+        w = (ok[:, nb] & ok[:, j:j + 1]).astype(np.float64)     # [T, k]
+        XX = np.einsum("tk,ki,kj->tij", w, X, X)
+        YX = np.einsum("tk,tki,kj->tij", w, Y, X)
+        det = XX[:, 0, 0] * XX[:, 1, 1] - XX[:, 0, 1] * XX[:, 1, 0]
+        good = (w.sum(1) >= 3) & (np.abs(det) > 1e-6 * (np.abs(XX).max() + 1e-9) ** 2)
+        inv = np.zeros_like(XX)
+        inv[:, 0, 0], inv[:, 1, 1] = XX[:, 1, 1], XX[:, 0, 0]
+        inv[:, 0, 1], inv[:, 1, 0] = -XX[:, 0, 1], -XX[:, 1, 0]
+        inv /= np.where(np.abs(det) > 0, det, 1.0)[:, None, None]
+        Aj = YX @ inv
+        if not good.any():
+            continue
+        # images sans voisins : dernière déformation connue (puis première)
+        idx = np.where(good, np.arange(T), 0)
+        np.maximum.accumulate(idx, out=idx)
+        first = int(np.argmax(good))
+        idx[:first] = first
+        Aj = Aj[idx]
+        if smooth > 0:
+            rr = int(math.ceil(3 * smooth))
+            ker = np.exp(-0.5 * (np.arange(-rr, rr + 1) / smooth) ** 2)
+            ker /= ker.sum()
+            flat = np.pad(Aj.reshape(T, 4), ((rr, rr), (0, 0)), mode="edge")
+            Aj = np.stack([np.convolve(flat[:, c], ker, mode="valid") for c in range(4)], 1).reshape(T, 2, 2)
+        # garde-fous : échelle 0,2–5
+        sc = np.sqrt(np.abs(Aj[:, 0, 0] * Aj[:, 1, 1] - Aj[:, 0, 1] * Aj[:, 1, 0]))
+        f = np.clip(sc, 0.2, 5.0) / np.maximum(sc, 1e-6)
+        A[:, j] = (Aj * f[:, None, None]).astype(np.float32)
+    sc = np.sqrt(np.abs(A[..., 0, 0] * A[..., 1, 1] - A[..., 0, 1] * A[..., 1, 0]))
+    ls = np.log(np.maximum(sc, 1e-6))
+    lo, hi = np.percentile(ls, [2, 98])
+    if hi - lo < 0.05:
+        depth = np.full((T, n), 0.5, np.float32)
+    else:
+        depth = np.clip((hi - ls) / (hi - lo), 0, 1).astype(np.float32)
+    return A, depth
 
 
 def valid_mask(res: "eng.TrackResult", cols: np.ndarray) -> np.ndarray:
@@ -208,7 +274,8 @@ def valid_mask(res: "eng.TrackResult", cols: np.ndarray) -> np.ndarray:
 
 
 def prepare_group(res: "eng.TrackResult", cols: np.ndarray, st: ShapeStyle,
-                  vis_threshold: float = 0.5, depth: Optional[np.ndarray] = None) -> GroupData:
+                  vis_threshold: float = 0.5, depth=None) -> GroupData:
+    """depth : ignoré (ancienne profondeur IA) ; la profondeur vient du suivi."""
     cols = np.asarray(cols, int)
     sub = eng.TrackResult(res.positions[:, cols], res.visibility[:, cols], res.tracked)
     smoothed = eng.smooth_tracks(sub.positions, sub.visibility, st.smooth)
@@ -227,21 +294,11 @@ def prepare_group(res: "eng.TrackResult", cols: np.ndarray, st: ShapeStyle,
         speed = np.where(visible, velocity, 0.0).astype(np.float32)
     rng = np.random.default_rng(1234)
     jit = 1.0 + st.size_jitter * (rng.random(res.positions.shape[1]) * 2 - 1)
-    d = None
-    if depth is not None:
-        d = depth[:, cols].astype(np.float32)
-        # profondeur maintenue pendant les occultations (dernière valeur connue)
-        for j in range(d.shape[1]):
-            v = d[:, j]
-            okd = np.isfinite(v)
-            if okd.any():
-                idx = np.where(okd, np.arange(len(v)), 0)
-                np.maximum.accumulate(idx, out=idx)
-                first = int(np.argmax(okd))
-                v[:first] = v[first]
-                d[:, j] = v[idx]
+    ok = valid_mask(res, cols) & (sub.visibility >= vis_threshold)
+    qf = res.query_frames[cols] if res.query_frames is not None else np.zeros(len(cols), int)
+    A, d = local_affine(smoothed, ok, qf)
     return GroupData(pos, alpha.astype(np.float32), speed, direction,
-                     jit[cols].astype(np.float32), cols, d)
+                     jit[cols].astype(np.float32), cols, d, A)
 
 
 # =============================================================================
@@ -283,18 +340,19 @@ class ShapeRenderer:
         return self._stamps[path]
 
     def _draw(self, canvas: np.ndarray, st: ShapeStyle, cx: float, cy: float,
-              sx: float, sy: float, ang: float, value: int) -> None:
+              Mx: np.ndarray, value: int) -> None:
+        """Mx : matrice 2×2 forme unitaire → pixels de travail (taille, rotation,
+        étirement, perspective)."""
         if st.shape == "image":
             stamp = self._stamp(st.image_path)
             if stamp is None:
-                return self._draw_poly(canvas, "circle", cx, cy, sx, sy, ang, value)
+                return self._draw_poly(canvas, "circle", cx, cy, Mx, value)
             h, w = stamp.shape
             k = 2.0 / max(h, w)
-            ca, sa = math.cos(math.radians(ang)), math.sin(math.radians(ang))
-            A = np.array([[ca * sx, -sa * sy], [sa * sx, ca * sy]]) * k
+            A = Mx * k
             t = np.array([cx, cy]) - A @ np.array([w / 2, h / 2])
             M = np.hstack([A, t[:, None]]).astype(np.float32)
-            r = int(math.ceil(max(sx, sy) * 1.5)) + 2
+            r = int(math.ceil(np.linalg.norm(Mx, 2) * 1.5)) + 2
             x0, y0 = max(0, int(cx) - r), max(0, int(cy) - r)
             x1, y1 = min(canvas.shape[1], int(cx) + r), min(canvas.shape[0], int(cy) + r)
             if x1 <= x0 or y1 <= y0:
@@ -306,24 +364,22 @@ class ShapeRenderer:
             roi = canvas[y0:y1, x0:x1]
             np.maximum(roi, warped, out=roi)
             return
-        self._draw_poly(canvas, st.shape, cx, cy, sx, sy, ang, value, ring=st.shape == "ring")
+        self._draw_poly(canvas, st.shape, cx, cy, Mx, value, ring=st.shape == "ring")
 
-    def _draw_poly(self, canvas, shape, cx, cy, sx, sy, ang, value, ring=False):
-        ca, sa = math.cos(math.radians(ang)), math.sin(math.radians(ang))
-        R = np.array([[ca, -sa], [sa, ca]])
+    def _draw_poly(self, canvas, shape, cx, cy, Mx, value, ring=False):
         f = float(1 << self.SHIFT)
         for poly in UNIT.get(shape, UNIT["circle"]):
-            pts = (poly * (sx, sy)) @ R.T + (cx, cy)
+            pts = poly @ Mx.T + (cx, cy)
             p = np.round(pts * f).astype(np.int32)
             if ring:
-                th = max(1, int(round(0.3 * min(sx, sy))))
+                th = max(1, int(round(0.3 * np.linalg.svd(Mx, compute_uv=False)[-1])))
                 cv2.polylines(canvas, [p], True, value, th, cv2.LINE_AA, self.SHIFT)
             else:
                 cv2.fillPoly(canvas, [p], value, cv2.LINE_AA, self.SHIFT)
 
     def _stamps_for(self, st: ShapeStyle, gd: GroupData, t: int, scale: float = 1.0,
                     shadow: bool = False):
-        """Liste (cx, cy, sx, sy, angle, alpha) en pixels de travail."""
+        """Liste (cx, cy, matrice 2×2, alpha) en pixels de travail."""
         out = []
         T = len(gd.alpha)
         trail = max(0, int(st.trail))
@@ -368,14 +424,20 @@ class ShapeRenderer:
                     dv = gd.direction[tk, j]
                     ang += math.degrees(math.atan2(dv[1], dv[0]))
                 cx, cy = x * self.rs, y * self.rs
+                sxx, syy = max(0.5, r * s * st.width), max(0.5, r * st.height)
+                ra = math.radians(ang)
+                Mx = np.array([[math.cos(ra) * sxx, -math.sin(ra) * syy],
+                               [math.sin(ra) * sxx, math.cos(ra) * syy]])
+                if st.perspective and gd.affine is not None:
+                    Pm = np.eye(2) + st.perspective_amount * (gd.affine[tk, j].astype(np.float64) - np.eye(2))
+                    Mx = Pm @ Mx
                 if shadow:
                     dist = st.shadow_dist * self.rs
                     if st.shadow_depth and np.isfinite(d):
                         dist *= 0.25 + 1.5 * (1.0 - d)
                     cx, cy = cx + ca * dist, cy + sa * dist
-                out.append((cx, cy, max(0.5, r * s * st.width), max(0.5, r * st.height), ang,
-                            al * (fade if k else 1.0)))
-        out.sort(key=lambda e: e[5])
+                out.append((cx, cy, Mx, al * (fade if k else 1.0)))
+        out.sort(key=lambda e: e[3])
         return out
 
     def _blur(self, img: np.ndarray, sigma: float) -> np.ndarray:
@@ -406,10 +468,10 @@ class ShapeRenderer:
             shape = np.zeros((self.h, self.w), np.uint8)
             amap = np.zeros_like(shape)
             cover = np.zeros_like(shape)
-            for cx, cy, sx, sy, ang, al in stamps:
-                self._draw(shape, st, cx, cy, sx, sy, ang, 255)
-                self._draw(amap, st, cx, cy, sx * 1.5, sy * 1.5, ang, int(round(al * 255)))
-                self._draw(cover, st, cx, cy, sx * 1.5, sy * 1.5, ang, 255)
+            for cx, cy, Mx, al in stamps:
+                self._draw(shape, st, cx, cy, Mx, 255)
+                self._draw(amap, st, cx, cy, Mx * 1.5, int(round(al * 255)))
+                self._draw(cover, st, cx, cy, Mx * 1.5, 255)
             sigma = st.merge * base
             field_ = self._blur(shape, sigma)
             lo, hi = st.threshold - st.softness, st.threshold + st.softness
@@ -421,8 +483,8 @@ class ShapeRenderer:
             m *= np.clip(self._blur(amap, sigma) / np.maximum(self._blur(cover, sigma), 1e-3), 0, 1)
         else:
             canvas = np.zeros((self.h, self.w), np.uint8)
-            for cx, cy, sx, sy, ang, al in stamps:
-                self._draw(canvas, st, cx, cy, sx, sy, ang, int(round(al * 255)))
+            for cx, cy, Mx, al in stamps:
+                self._draw(canvas, st, cx, cy, Mx, int(round(al * 255)))
             m = self._blur(canvas, st.softness * base * 2.0)
         return m
 
@@ -456,14 +518,13 @@ class ShapeRenderer:
             span = max(1, int(st.slit_span))
             K = min(12, span + 1)
             times = [max(0, t - int(round(i * span / (K - 1)))) for i in range(K)]
-            layers = [self._core(st, gd, tk) for tk in times]
             f = self._slit_map(mode) * (K - 1)
-            i0 = np.clip(np.floor(f).astype(int), 0, K - 1)
-            i1 = np.clip(i0 + 1, 0, K - 1)
-            a = f - i0
-            stack = np.stack(layers)
-            yy, xx = np.indices(f.shape)
-            return stack[i0, yy, xx] * (1 - a) + stack[i1, yy, xx] * a
+            out = np.zeros(f.shape, np.float32)
+            for i, tk in enumerate(times):
+                w = np.maximum(0.0, 1.0 - np.abs(f - i))
+                if w.any():
+                    out += self._core(st, gd, tk) * w
+            return out
         return self._core(st, gd, t)
 
     def render_group(self, st: ShapeStyle, gd: GroupData, t: int) -> np.ndarray:
@@ -508,33 +569,198 @@ class ShapeRenderer:
         return (np.clip(out, 0, 1) * 255 + 0.5).astype(np.uint8)
 
 
+    # --------------------------------------------------------- rush masqué
+    def composite(self, layers: Sequence[tuple], t: int,
+                  get_frame: Callable[[int], Optional[np.ndarray]],
+                  background: str = "transparent"):
+        """RUSH MASQUÉ + EFFETS : l'image d'origine visible dans les formes, et
+        les effets appliqués à cette image (pas seulement au masque) :
+        • écho : les images passées du sujet masqué, superposées et estompées ;
+        • slit-scan : chaque zone montre le sujet masqué à un autre instant ;
+        • ombre portée : l'ombre du sujet découpé sur le fond.
+        background : transparent · black · original · dim · blur.
+        → (BGR uint8 [out_h, out_w, 3], alpha uint8 [out_h, out_w])."""
+        cache: Dict[int, Optional[np.ndarray]] = {}
+
+        def img(tt: int) -> Optional[np.ndarray]:
+            if tt not in cache:
+                f = get_frame(tt) if tt >= 0 else None
+                if f is not None and f.shape[:2] != (self.h, self.w):
+                    f = cv2.resize(f, (self.w, self.h), interpolation=cv2.INTER_AREA)
+                cache[tt] = None if f is None else f.astype(np.float32) * (1.0 / 255.0)
+            return cache[tt]
+
+        cur = img(t)
+        if cur is None:
+            cur = np.zeros((self.h, self.w, 3), np.float32)
+        if background == "original":
+            col = cur.copy()
+        elif background == "dim":
+            col = cur * 0.3
+        elif background == "blur":
+            col = cv2.GaussianBlur(cur, (0, 0), max(2.0, self.w / 90.0))
+        else:
+            col = np.zeros_like(cur)
+        bg = col.copy()
+        alpha = np.zeros((self.h, self.w), np.float32)
+
+        def over(c, a, src, m):
+            m3 = m[..., None]
+            return c * (1 - m3) + src * m3, np.maximum(a, m)
+
+        act = [(st, gd) for st, gd, on in layers if on and gd is not None and len(gd.ids)]
+        adds = [(st, gd) for st, gd in act if st.mode != "subtract"]
+        subs = [(st, gd) for st, gd in act if st.mode == "subtract"]
+        if not adds and subs:
+            col, alpha = cur.copy(), np.ones_like(alpha)
+        for st, gd in adds:
+            base = lambda tt, sc=1.0: self._core(st, gd, tt, scale=sc) * float(st.opacity)
+            m_now = base(t)
+            mode = st.echo_mode
+            fx_m = m_now
+            layers_fx = []
+            if mode == "echo":
+                for k in range(max(0, int(st.echo_count)), 0, -1):    # du plus ancien au plus récent
+                    tk = t - k * max(1, int(st.echo_step))
+                    src = img(tk)
+                    if tk < 0 or src is None:
+                        continue
+                    mk = base(tk, st.echo_scale ** k) * (st.echo_decay ** k)
+                    layers_fx.append((src, mk))
+                    fx_m = np.maximum(fx_m, mk)
+            elif mode in ("slit_h", "slit_v", "slit_radial"):
+                span = max(1, int(st.slit_span))
+                K = min(12, span + 1)
+                f = self._slit_map(mode) * (K - 1)
+                m_sl = np.zeros_like(alpha)
+                c_sl = np.zeros_like(cur)
+                for i in range(K):
+                    w = np.maximum(0.0, 1.0 - np.abs(f - i))
+                    if not w.any():
+                        continue
+                    tk = max(0, t - int(round(i * span / (K - 1))))
+                    src = img(tk)
+                    mi = base(tk) * w
+                    m_sl += mi
+                    c_sl += (src if src is not None else cur) * mi[..., None]
+                c_sl = c_sl / np.maximum(m_sl, 1e-6)[..., None]
+                m_now, cur_g = m_sl, c_sl
+                fx_m = m_sl
+            elif mode == "slit_depth":
+                m_now = self._timed(st, gd, t) * float(st.opacity)
+                fx_m = m_now
+            # ombre portée du sujet découpé (sous tout le reste)
+            if st.shadow_on and st.shadow_opacity > 0:
+                dist = st.shadow_dist * self.rs
+                dx = math.cos(math.radians(st.shadow_angle)) * dist
+                dy = math.sin(math.radians(st.shadow_angle)) * dist
+                sh = cv2.warpAffine(fx_m, np.float32([[1, 0, dx], [0, 1, dy]]), (self.w, self.h))
+                sh = self._blurf(sh, st.shadow_soft * self.rs) * st.shadow_opacity
+                col = col * (1 - sh[..., None])
+                alpha = np.maximum(alpha, sh)
+            for src, mk in layers_fx:
+                col, alpha = over(col, alpha, src, mk)
+            col, alpha = over(col, alpha, cur_g if mode in ("slit_h", "slit_v", "slit_radial") else cur, m_now)
+        if subs:
+            hole = np.zeros_like(alpha)
+            for st, gd in subs:
+                hole = np.maximum(hole, self._core(st, gd, t) * float(st.opacity))
+            col = col * (1 - hole[..., None]) + bg * hole[..., None]
+            alpha = alpha * (1 - hole)
+        if background != "transparent":
+            alpha = np.ones_like(alpha)
+        out = np.clip(col * 255 + 0.5, 0, 255).astype(np.uint8)
+        a8 = np.clip(alpha * 255 + 0.5, 0, 255).astype(np.uint8)
+        if (self.w, self.h) != (self.out_w, self.out_h):
+            out = cv2.resize(out, (self.out_w, self.out_h), interpolation=cv2.INTER_LINEAR)
+            a8 = cv2.resize(a8, (self.out_w, self.out_h), interpolation=cv2.INTER_LINEAR)
+        return out, a8
+
+
+def frames_back(layers: Sequence[tuple]) -> int:
+    """Nombre d'images passées nécessaires au rendu masqué."""
+    n = 0
+    for st, gd, on in layers:
+        if not on:
+            continue
+        if st.echo_mode == "echo":
+            n = max(n, int(st.echo_count) * max(1, int(st.echo_step)))
+        elif st.echo_mode.startswith("slit"):
+            n = max(n, int(st.slit_span))
+    return n
+
+
+def write_composite_video(out_base: str, info: "eng.VideoInfo", codec: str, layers: Sequence[tuple],
+                          background: str = "transparent", progress=None, cancel=None) -> str:
+    """Vidéo « rush masqué + effets » pleine résolution. Fond transparent →
+    ProRes 4444 avec alpha (ou PNG avec alpha) ; sinon le codec choisi."""
+    T = len(layers[0][1].alpha) if layers else 0
+    ren = ShapeRenderer(info.width, info.height, info.width, info.height,
+                        work_max_side=max(info.width, info.height))
+    alpha_out = background == "transparent"
+    if alpha_out and codec not in ("png",):
+        codec = "prores4444"
+    writer = eng.MatteWriter(out_base, info, codec, suffix="_masque",
+                             gray=False, channels=4 if alpha_out else 3)
+    back = frames_back(layers)
+    buf: Dict[int, np.ndarray] = {}
+    try:
+        for t, frame in eng.iter_frames(info.path):
+            if cancel is not None and cancel.is_set():
+                raise eng.Cancelled()
+            buf[t] = frame
+            for k in [k for k in buf if k < t - back]:
+                del buf[k]
+            if t < T:
+                rgb, a = ren.composite(layers, t, buf.get, background)
+            else:
+                rgb, a = frame, np.full(frame.shape[:2], 255, np.uint8)
+            writer.write(np.dstack([rgb, a]) if alpha_out else rgb)
+            if progress is not None and (t % 4 == 0):
+                progress("Rendu du rush masqué", (t + 1) / max(1, info.frame_count or T))
+    finally:
+        writer.close()
+    return writer.path
+
+
 # =============================================================================
 # Fichier de suivi pour l'effet OFX « TAPNext Shapes » (.tapfx)
 # =============================================================================
 
 def export_tapfx(path: str, res: "eng.TrackResult", point_groups: np.ndarray,
-                 width: int, height: int, fps: float,
-                 depth: Optional[np.ndarray] = None) -> str:
-    """Écrit le fichier binaire lu par le plugin OFX (voir TAPNextShapes.cpp).
+                 width: int, height: int, fps: float, depth=None) -> str:
+    """Écrit le fichier binaire lu par le plugin OFX (voir TAPNextShapes.cpp),
+    format v3 : + profondeur et déformation locale (perspective) DÉDUITES DU
+    SUIVI, calculées groupe par groupe comme dans Studio.
 
     point_groups : [Q] numéro de groupe (0, 1, 2… dans l'ordre de Studio).
-    depth : [T, Q] profondeur 0..1 (0 = proche, NaN = inconnue) → format v2.
+    depth : ignoré (ancienne profondeur IA).
     """
     T, Q = res.visibility.shape
     valid = valid_mask(res, np.arange(Q))
+    dep = np.full((T, Q), np.nan, np.float32)
+    aff = np.tile(np.eye(2, dtype=np.float32), (T, Q, 1, 1))
+    qf = res.query_frames if res.query_frames is not None else np.zeros(Q, int)
+    for g in np.unique(point_groups):
+        cols = np.nonzero(point_groups == g)[0]
+        if len(cols) < 4:
+            continue
+        sm = eng.smooth_tracks(res.positions[:, cols], res.visibility[:, cols], 2.1)
+        ok = valid[:, cols] & (res.visibility[:, cols] >= 0.5)
+        A, d = local_affine(sm, ok, qf[cols])
+        aff[:, cols] = A
+        if d is not None:
+            dep[:, cols] = d
     with open(path, "wb") as f:
-        f.write(b"TAPFX02\0" if depth is not None else b"TAPFX01\0")
+        f.write(b"TAPFX03\0")
         np.array([width, height, T, Q, 0, 0, 0, 0], "<i4").tofile(f)
         np.array([fps], "<f4").tofile(f)
         np.ascontiguousarray(res.positions, "<f4").tofile(f)
         np.ascontiguousarray(res.visibility, "<f4").tofile(f)
         np.ascontiguousarray(valid, np.uint8).tofile(f)
         np.ascontiguousarray(point_groups, "<i4").tofile(f)
-        if depth is not None:
-            d = np.full((T, Q), np.nan, np.float32)
-            n = min(T, len(depth))
-            d[:n] = np.asarray(depth, np.float32)[:n, :Q]
-            np.ascontiguousarray(d, "<f4").tofile(f)
+        np.ascontiguousarray(dep, "<f4").tofile(f)
+        np.ascontiguousarray(aff.reshape(T, Q, 4), "<f4").tofile(f)
     remember_last_tapfx(path)
     return path
 

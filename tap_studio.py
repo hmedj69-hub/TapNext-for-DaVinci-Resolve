@@ -11,9 +11,10 @@ TAPNext Studio — interface visuelle de tracking TAPNext++ pour DaVinci Resolve
   • Groupes de formes : forme (cercle, étoile, image PNG…), révéler/découper,
     taille, rotation, réaction au mouvement, fondus activables, toujours
     visible, fusion, traînée — rendu en direct, sans relancer le suivi.
-  • Tracker 3D : caméra résolue (structure-from-motion) et profondeur IA
-    stabilisée par le suivi → formes selon la profondeur, ombres portées,
-    échos temporels, slit-scan / time-slice.
+  • Perspective et profondeur DÉDUITES DU SUIVI : les formes épousent la
+    surface (taille, raccourci) ; ombres portées, échos, slit-scan.
+  • Rush masqué + effets : l'image d'origine dans les formes, avec échos,
+    slit-scan et ombre appliqués à l'image (vue et export avec alpha).
   • Projets .tapnext (points, suivi et formes enregistrés).
   • Export : matte N&B (ProRes/DNxHR/H.264/PNG), une matte par groupe, CSV/JSON,
     nœuds Fusion. Depuis Resolve, les résultats y repartent automatiquement.
@@ -60,8 +61,6 @@ from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import camera_solver as cs  # noqa: E402
-import depth_engine as de  # noqa: E402
 import motion_solver as ms  # noqa: E402
 import shape_engine as se  # noqa: E402
 import stabilizer as sb  # noqa: E402
@@ -127,6 +126,7 @@ class VideoStore:
         self.loaded = 0
         self.complete = False
         self._lru: "OrderedDict[int, np.ndarray]" = OrderedDict()
+        self._lock = threading.Lock()     # lu par plusieurs fils (aperçu, analyse, suivi)
 
     def put(self, i: int, frame_bgr: np.ndarray) -> None:
         small = frame_bgr if self.scale >= 1 else cv2.resize(
@@ -143,15 +143,19 @@ class VideoStore:
         self.complete = True
 
     def frame(self, i: int) -> Optional[np.ndarray]:
-        if i in self._lru:
-            self._lru.move_to_end(i)
-            return self._lru[i]
-        if not (0 <= i < len(self.jpegs)) or self.jpegs[i] is None:
+        with self._lock:
+            hit = self._lru.get(i)
+            if hit is not None:
+                self._lru.move_to_end(i)
+                return hit
+            data = self.jpegs[i] if 0 <= i < len(self.jpegs) else None
+        if data is None:
             return None
-        img = cv2.imdecode(np.frombuffer(self.jpegs[i], np.uint8), cv2.IMREAD_COLOR)
-        self._lru[i] = img
-        if len(self._lru) > 48:
-            self._lru.popitem(last=False)
+        img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+        with self._lock:
+            self._lru[i] = img
+            while len(self._lru) > 64:
+                self._lru.popitem(last=False)
         return img
 
 
@@ -360,34 +364,74 @@ class Timeline(QWidget):
             self.seek.emit(self._f(e.position().x()))
 
 
-class DepthThread(QThread):
-    """Profondeur IA (Depth Anything V2) stabilisée par les points suivis."""
-    progress = Signal(str, float)
-    done = Signal(object, object)
-    failed = Signal(str)
+class PreviewWorker(QThread):
+    """Rendu de la vue en arrière-plan : formes, rush masqué, aperçu stabilisé.
+    Une seule demande en attente (la plus récente) : l'interface ne se bloque
+    jamais, même pendant la lecture."""
+    done = Signal(int, str, object)
 
-    def __init__(self, store, t0, t1, positions, valid, inv_depth=None):
+    def __init__(self):
         super().__init__()
-        self.store, self.t0, self.t1 = store, t0, t1
-        self.positions, self.valid, self.inv_depth = positions, valid, inv_depth
-        self.cancel = threading.Event()
+        self._cv = threading.Condition()
+        self._job = None
+        self._alive = True
+        self._ren = None
+        self._rkey = None
+
+    def request(self, job: dict):
+        with self._cv:
+            self._job = job
+            self._cv.notify()
+
+    def stop(self):
+        with self._cv:
+            self._alive = False
+            self._cv.notify()
+        self.wait(3000)
 
     def run(self):
-        try:
-            self.progress.emit("Chargement du modèle de profondeur (~100 Mo, une seule fois)…", 0)
-            disp = de.estimate(self.store.frame, self.t0, self.t1, "cuda",
-                               progress=self.progress.emit, cancel=self.cancel)
-            info = self.store.info
-            self.progress.emit("Stabilisation temporelle de la profondeur", 0.99)
-            clip = de.stabilize(disp, self.t0, self.positions, self.valid, info.width, info.height,
-                                inv_depth=self.inv_depth)
-            pd = de.point_depth(clip, self.positions, self.valid, info.width, info.height)
-            self.done.emit(clip, pd)
-        except eng.Cancelled:
-            self.failed.emit("Calcul de profondeur annulé.")
-        except Exception as e:
-            traceback.print_exc()
-            self.failed.emit(f"{type(e).__name__} : {e}")
+        while True:
+            with self._cv:
+                while self._alive and self._job is None:
+                    self._cv.wait()
+                if not self._alive:
+                    return
+                job, self._job = self._job, None
+            try:
+                out = self._render(job)
+            except Exception:
+                traceback.print_exc()
+                out = None
+            self.done.emit(job["token"], job["kind"], out)
+
+    def _render(self, j: dict):
+        W, H = j["src"]
+        if j["kind"] == "stab":
+            return sb.warp_frame(j["img"], j["t"], j["C"], W, H, L=j["L"], path=j["path"],
+                                 get_frame=j["get_frame"], fill=j["fill"], max_dist=8, quality=False)
+        pw, ph = j["size"]
+        key = (W, H, pw, ph)
+        if self._rkey != key:
+            self._ren = se.ShapeRenderer(W, H, pw, ph, 960)
+            self._rkey = key
+        ren, layers, t = self._ren, j["layers"], j["t"]
+        if j["mode"] == "composite":
+            bgr, a = ren.composite(layers, t, j["get_frame"], j["background"])
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            if j["background"] == "transparent":   # damier sombre sous la transparence
+                yy, xx = np.indices(a.shape)
+                chk = np.where(((yy // 16 + xx // 16) % 2) == 0, 38, 52).astype(np.float32)[..., None]
+                af = (a.astype(np.float32) / 255.0)[..., None]
+                rgb = (rgb * af + chk * (1 - af)).astype(np.uint8)
+            return np.dstack([rgb, np.full(a.shape, 255, np.uint8)])
+        m = ren.render(layers, t, j["invert"]) if layers else \
+            np.full((ph, pw), 255 if j["invert"] else 0, np.uint8)
+        if j["mode"] == "matte":
+            return m
+        rgba = np.zeros((m.shape[0], m.shape[1], 4), np.uint8)
+        rgba[..., 0], rgba[..., 1], rgba[..., 2] = 255, 70, 60
+        rgba[..., 3] = (m.astype(np.uint16) * 140 // 255).astype(np.uint8)
+        return rgba
 
 
 class AnalyzeThread(QThread):
@@ -409,28 +453,6 @@ class AnalyzeThread(QThread):
             self.done.emit(m, self.key)
         except eng.Cancelled:
             self.failed.emit("Analyse annulée.")
-        except Exception as e:
-            traceback.print_exc()
-            self.failed.emit(f"{type(e).__name__} : {e}")
-
-
-class CameraThread(QThread):
-    """Solveur de caméra 3D (structure-from-motion sur les points suivis)."""
-    progress = Signal(str, float)
-    done = Signal(object)
-    failed = Signal(str)
-
-    def __init__(self, positions, valid, W, H, t0, t1, fov, cols):
-        super().__init__()
-        self.args = (positions, valid, W, H, t0, t1)
-        self.fov, self.cols = fov, cols
-        self.cancel = threading.Event()
-
-    def run(self):
-        try:
-            r = cs.solve_camera(*self.args, fov_deg=self.fov, cols=self.cols,
-                                progress=self.progress.emit)
-            self.done.emit(r)
         except Exception as e:
             traceback.print_exc()
             self.failed.emit(f"{type(e).__name__} : {e}")
@@ -469,15 +491,6 @@ class ExportThread(QThread):
                                  quad=quad, name=node)
                 outputs.append(p)
                 j.setdefault("settings", {})[mode] = p
-            if j.get("depth_clip") is not None:
-                # Profondeur pour l'effet OFX « TAPNext Profondeur & Temps ».
-                p = de.export_tapdepth(base + ".tapdepth", j["depth_clip"], info.width, info.height)
-                outputs.append(p)
-                j["tapdepth"] = p
-                if j.get("depth_video"):
-                    outputs.append(de.write_depth_video(base, info, j["codec"], j["depth_clip"],
-                                                        j["n_total"], progress=self.progress.emit,
-                                                        cancel=self.cancel))
             if j.get("stab_C") is not None:
                 # Vidéo stabilisée pleine résolution (même durée et timecode que la source).
                 p = sb.render_video(base, info, j["codec"], j["stab_C"], L=j.get("stab_L"),
@@ -490,20 +503,15 @@ class ExportThread(QThread):
                 return
             # Fichier de suivi pour l'effet OFX « TAPNext Shapes » de Resolve.
             tapfx = base + ".tapfx"
-            se.export_tapfx(tapfx, res, j["point_groups"], info.width, info.height, info.fps,
-                            depth=j.get("point_depth"))
+            se.export_tapfx(tapfx, res, j["point_groups"], info.width, info.height, info.fps)
             outputs.append(tapfx)
             j["tapfx"] = tapfx
-            cam = j.get("camera")
-            if cam is not None:
-                # Caméra 3D : nœud Camera3D (+ repères 3D), nuage de points, JSON.
-                p = base + "_fusion_camera3d.setting"
-                cs.write_fusion_camera(p, cam, j["frames"], offset,
-                                       locators=cs.pick_locators(cam, j["cam_valid"]))
-                cs.write_ply(base + "_points3d.ply", cam)
-                cs.write_json(base + "_camera.json", cam, j["frames"])
-                outputs += [p, base + "_points3d.ply", base + "_camera.json"]
-                j.setdefault("settings", {})["camera3d"] = p
+            if j.get("composite"):
+                # Rush masqué + effets (écho, slit-scan, ombre sur l'image).
+                p = se.write_composite_video(base, info, j["codec"], j["layers"], j["background"],
+                                             progress=self.progress.emit, cancel=self.cancel)
+                outputs.append(p)
+                j["composite_video"] = p
             if j["matte"]:
                 outputs += se.write_shapes_video(
                     base, info, j["codec"], j["layers"], j["invert"], j["preview"],
@@ -595,6 +603,12 @@ class StyleEditor(QWidget):
         self.rotation = self._slider(v, "rotation", "Rotation (°)", -180, 180, 1, "{:.0f}")
         self.follow = self._check(v, "follow_motion", "Orienter dans le sens du mouvement")
         self.jitter = self._slider(v, "size_jitter", "Variation aléatoire de taille", 0, 1, 0.01, "{:.2f}")
+        self.persp = self._check(v, "perspective", "Épouser la perspective de la surface (suivi)")
+        self.persp.setToolTip("Chaque forme se déforme comme la surface sous elle, mesurée par ses "
+                              "points voisins : elle rapetisse quand la surface s'éloigne, se raccourcit "
+                              "quand elle tourne. Aucune IA : c'est le suivi TAPNext qui le donne.")
+        self.persp_amt = self._slider(v, "perspective_amount", "Intensité de la perspective", 0, 1, 0.01,
+                                      "{:.2f}")
 
         v = section("Réaction au mouvement")
         self.grow = self._slider(v, "grow", "Grossir avec la vitesse", 0, 1, 0.005, "{:.3f}")
@@ -636,31 +650,19 @@ class StyleEditor(QWidget):
         self.trail = self._slider(v, "trail", "Traînée dans la matte (images)", 0, 30, 1, "{:.0f}")
         self.smooth = self._slider(v, "smooth", "Lissage des trajectoires", 0, 5, 0.1, "{:.1f}")
 
-        v = section("Profondeur")
-        self.depth_hint = help_label("Calculez d'abord la profondeur ou la caméra 3D "
-                                     "(onglet ④ 3D). 0 = proche, 1 = loin.")
-        v.addWidget(self.depth_hint)
-        self.d_scale = self._slider(v, "depth_scale", "Perspective (proche = plus gros)", 0, 1, 0.01,
-                                    "{:.2f}", "Les formes rapetissent en s'éloignant de la caméra")
-        self.d_near = self._slider(v, "depth_near", "Garder à partir de", 0, 1, 0.01, "{:.2f}",
-                                   "Profondeur minimale gardée (0 = tout le premier plan)")
-        self.d_far = self._slider(v, "depth_far", "Garder jusqu'à", 0, 1, 0.01, "{:.2f}",
-                                  "Profondeur maximale gardée (1 = jusqu'au fond)")
-        self.d_feather = self._slider(v, "depth_feather", "Fondu de la plage", 0, 0.5, 0.01, "{:.2f}")
-        self.d_fog = self._slider(v, "depth_fog", "Brume (s'efface au loin)", 0, 1, 0.01, "{:.2f}")
-
         v = section("Ombre portée")
         self.sh_on = self._check(v, "shadow_on", "Ajouter une ombre portée")
         self.sh_angle = self._slider(v, "shadow_angle", "Direction (°)", -180, 360, 1, "{:.0f}")
         self.sh_dist = self._slider(v, "shadow_dist", "Distance (px)", 0, 200, 0.5, "{:.1f}")
         self.sh_soft = self._slider(v, "shadow_soft", "Flou (px)", 0, 60, 0.5, "{:.1f}")
         self.sh_op = self._slider(v, "shadow_opacity", "Opacité", 0, 1, 0.01, "{:.2f}")
-        self.sh_depth = self._check(v, "shadow_depth", "Distance selon la profondeur (proche = loin du sol)")
+        self.sh_depth = self._check(v, "shadow_depth", "Distance selon la profondeur (déduite du suivi)")
 
         v = section("Écho temporel / slit-scan")
         v.addWidget(help_label("<b>Écho</b> : copies passées qui s'estompent. <b>Slit-scan</b> : "
                                "chaque zone de l'image montre un instant différent. "
-                               "<b>Time-slice</b> : le décalage dépend de la profondeur."))
+                               "<b>Time-slice</b> : le décalage dépend de la profondeur (suivi). "
+                               "Vue « Rush masqué » : l'effet s'applique à l'image dans les formes."))
         self.echo_mode = QComboBox()
         for m in se.ECHO_MODES:
             self.echo_mode.addItem(se.ECHO_LABELS[m], m)
@@ -717,6 +719,7 @@ class StyleEditor(QWidget):
         self.fin.setEnabled(not a and self.st.fade_in_on)
         self.fout.setEnabled(not a and self.st.fade_out_on)
         self.thr.setEnabled(self.st.merge > 0)
+        self.persp_amt.setEnabled(self.st.perspective)
         for w in (self.sh_angle, self.sh_dist, self.sh_soft, self.sh_op, self.sh_depth):
             w.setEnabled(self.st.shadow_on)
         em = self.st.echo_mode
@@ -734,9 +737,7 @@ class StyleEditor(QWidget):
                      (self.jitter, "size_jitter"), (self.grow, "grow"), (self.stretch, "stretch"),
                      (self.max_scale, "max_scale"), (self.merge, "merge"), (self.thr, "threshold"),
                      (self.soft, "softness"), (self.trail, "trail"), (self.smooth, "smooth"),
-                     (self.d_scale, "depth_scale"), (self.d_near, "depth_near"),
-                     (self.d_far, "depth_far"), (self.d_feather, "depth_feather"),
-                     (self.d_fog, "depth_fog"), (self.sh_angle, "shadow_angle"),
+                     (self.persp_amt, "perspective_amount"), (self.sh_angle, "shadow_angle"),
                      (self.sh_dist, "shadow_dist"), (self.sh_soft, "shadow_soft"),
                      (self.sh_op, "shadow_opacity"), (self.e_count, "echo_count"),
                      (self.e_step, "echo_step"), (self.e_decay, "echo_decay"),
@@ -745,6 +746,7 @@ class StyleEditor(QWidget):
             w.set(getattr(st, k))
             w.s.blockSignals(False)
         self.follow.setChecked(st.follow_motion)
+        self.persp.setChecked(st.perspective)
         self.always.setChecked(st.always_visible)
         self.fin_on.setChecked(st.fade_in_on)
         self.fout_on.setChecked(st.fade_out_on)
@@ -822,31 +824,19 @@ class Viewer(QWidget):
         target = QRectF(self.off.x(), self.off.y(), info.width * self.s, info.height * self.s)
         p.setRenderHint(QPainter.SmoothPixmapTransform)
         mode = w.view_mode()
-        if mode == "matte":
+        if mode in ("matte", "composite"):
             p.fillRect(target, QColor("black"))
         elif self.qimg is not None:
             p.drawImage(target, self.qimg)
         else:
             p.setPen(QColor("#77787f"))
             p.drawText(target, Qt.AlignCenter, "Chargement…")
-        if self.overlay is not None and mode in ("matte", "overlay", "depth"):
+        if self.overlay is not None and mode in ("matte", "overlay", "composite"):
             p.drawImage(target, self.overlay)
         p.setRenderHint(QPainter.Antialiasing)
         if mode != "matte" or w.show_points_on_matte():
             self._draw_tracks(p)
         self._draw_zones(p)
-        c3 = w.cam_points_now()
-        if c3 is not None:
-            p.setPen(QPen(QColor(0, 0, 0, 160), 3))
-            for x, y in c3:
-                sp = self.to_screen(x, y)
-                p.drawLine(QPointF(sp.x() - 4, sp.y()), QPointF(sp.x() + 4, sp.y()))
-                p.drawLine(QPointF(sp.x(), sp.y() - 4), QPointF(sp.x(), sp.y() + 4))
-            p.setPen(QPen(QColor(80, 230, 255), 1.4))
-            for x, y in c3:
-                sp = self.to_screen(x, y)
-                p.drawLine(QPointF(sp.x() - 4, sp.y()), QPointF(sp.x() + 4, sp.y()))
-                p.drawLine(QPointF(sp.x(), sp.y() - 4), QPointF(sp.x(), sp.y() + 4))
         q = w.quad_now()
         if q is not None and np.all(np.isfinite(q)):
             pts = [self.to_screen(x, y) for x, y in q]
@@ -1130,15 +1120,14 @@ class StudioWindow(QMainWindow):
         self.motion_key = None
         self.analyze_thread: Optional[AnalyzeThread] = None
         self.stab_info = None
+        self.preview_worker = PreviewWorker()
+        self.preview_worker.done.connect(self._on_preview)
+        self.preview_worker.start()
+        self._ptoken = 0
+        self._pshown = 0
         self.C = None                # correction de stabilisation par image
         self.zoom = 1.0
         self.quad_ref = None         # 4 coins (insertion planaire) sur l'image de référence
-        self.cam = None              # caméra 3D résolue (onglet ④)
-        self.depth_clip = None       # cartes de profondeur (onglet ④)
-        self.point_depth = None      # [T, Q] profondeur 0..1 de chaque point
-        self.depth_version = 0
-        self.depth_thread: Optional[DepthThread] = None
-        self.camera_thread: Optional[CameraThread] = None
         self._drag_quad = -1
         self.solve_timer = QTimer(self)
         self.solve_timer.setSingleShot(True)
@@ -1192,7 +1181,7 @@ class StudioWindow(QMainWindow):
         self.tool_btns["lasso"].setChecked(True)
         top.addStretch(1)
         self.view_combo = QComboBox()
-        self.view_combo.addItems(["Image + points", "Image + matte", "Matte seule", "Profondeur"])
+        self.view_combo.addItems(["Image + points", "Image + matte", "Matte seule", "Rush masqué (rendu final)"])
         self.view_combo.setCurrentIndex(1)
         self.view_combo.currentIndexChanged.connect(lambda _: self._refresh_overlay())
         top.addWidget(QLabel("Vue :"))
@@ -1233,8 +1222,7 @@ class StudioWindow(QMainWindow):
         self.tabs.addTab(self._scroll(self._tab_tracking()), "① Suivi")
         self.tabs.addTab(self._scroll(self._tab_shapes()), "② Formes")
         self.tabs.addTab(self._scroll(self._tab_motion()), "③ Stabiliser")
-        self.tabs.addTab(self._scroll(self._tab_3d()), "④ 3D")
-        self.tabs.addTab(self._scroll(self._tab_export()), "⑤ Export")
+        self.tabs.addTab(self._scroll(self._tab_export()), "④ Export")
         self.tabs.currentChanged.connect(lambda i: (self._update_image(), self._refresh_overlay(),
                                                     self._schedule_solve() if i == 2 else None))
         root.addWidget(self.tabs)
@@ -1433,12 +1421,25 @@ class StudioWindow(QMainWindow):
         gl.addLayout(row)
         pv.addWidget(g)
 
-        g = QGroupBox("Matte finale")
+        g = QGroupBox("Rendu final")
         gl = QVBoxLayout(g)
         self.cb_invert = QCheckBox("Inverser la matte finale")
         self.cb_invert.setChecked(True)
         self.cb_invert.toggled.connect(self._schedule_overlay)
         gl.addWidget(self.cb_invert)
+        gl.addWidget(help_label("<b>Rush masqué</b> (vue en haut à droite et export) : l'image "
+                                "d'origine visible dans les formes ; l'écho, le slit-scan et "
+                                "l'ombre s'appliquent à cette image."))
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Fond du rush masqué"))
+        self.bg_combo = QComboBox()
+        for key, label in (("transparent", "Transparent (alpha)"), ("black", "Noir"),
+                           ("original", "Rush original"), ("dim", "Rush assombri"),
+                           ("blur", "Rush flou")):
+            self.bg_combo.addItem(label, key)
+        self.bg_combo.currentIndexChanged.connect(self._schedule_overlay)
+        row.addWidget(self.bg_combo, 1)
+        gl.addLayout(row)
         pv.addWidget(g)
         pv.addStretch(1)
         self._group_widgets_enabled(False)
@@ -1501,7 +1502,7 @@ class StudioWindow(QMainWindow):
                                      "tremblements. 30 ≈ 1 s : caméra à l'épaule très douce.")
         self.st_smooth.changed.connect(self._schedule_solve)
         gl.addWidget(self.st_smooth)
-        self.st_crop = ValueSlider("Recadrage maximal (%)", 0, 30, 10, 0.5, "{:.1f}",
+        self.st_crop = ValueSlider("Recadrage maximal (%)", 0, 30, 12, 0.5, "{:.1f}",
                                    "Limite du zoom. Là où la correction demanderait plus, elle "
                                    "est adoucie localement au lieu de zoomer tout le plan.")
         self.st_crop.changed.connect(self._schedule_solve)
@@ -1530,6 +1531,7 @@ class StudioWindow(QMainWindow):
         self.st_local.toggled.connect(self._schedule_solve)
         gl.addWidget(self.st_local)
         self.st_fill = QCheckBox("Bords reconstruits avec les images voisines (moins de zoom)")
+        self.st_fill.setChecked(True)
         self.st_fill.setToolTip("Les zones qui sortent du cadre sont remplies avec les images "
                                 "précédentes et suivantes, recalées : stabilisation quasi plein cadre.")
         self.st_fill.toggled.connect(self._schedule_solve)
@@ -1556,7 +1558,7 @@ class StudioWindow(QMainWindow):
         gl.addWidget(help_label(
             "Avec le modèle <b>Perspective</b>, 4 coins orange apparaissent dans la vue : "
             "glissez-les sur la surface à remplacer (écran, panneau, mur…). Ils suivent la "
-            "surface sur tout le plan → nœud Fusion <i>CornerPositioner</i> (onglet ⑤)."))
+            "surface sur tout le plan → nœud Fusion <i>CornerPositioner</i> (onglet ④)."))
         b = QPushButton("Réinitialiser les coins")
         b.clicked.connect(self._reset_quad)
         gl.addWidget(b)
@@ -1829,241 +1831,12 @@ class StudioWindow(QMainWindow):
             jobs.append(("cornerpin", "corner", self.solve.H, self.quad_ref.copy(), "TAP_CornerPin"))
         return jobs
 
-    def _tab_3d(self) -> QWidget:
-        panel = QWidget()
-        pv = QVBoxLayout(panel)
-        pv.setContentsMargins(8, 4, 10, 10)
-        g = QGroupBox("Caméra 3D (tracker 3D)")
-        gl = QVBoxLayout(g)
-        gl.addWidget(help_label(
-            "Retrouve le mouvement réel de la caméra dans l'espace et la position 3D des points "
-            "(comme le Camera Tracker de Fusion). Utilisez un groupe posé sur le <b>décor fixe</b>, "
-            "bien réparti, avec une caméra qui se <b>déplace</b> (un simple panoramique ne donne "
-            "que la rotation)."))
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Points utilisés"))
-        self.cam_group = QComboBox()
-        row.addWidget(self.cam_group, 1)
-        gl.addLayout(row)
-        row = QHBoxLayout()
-        self.cam_fov_auto = QCheckBox("Focale automatique")
-        self.cam_fov_auto.setChecked(True)
-        self.cam_fov = QSpinBox()
-        self.cam_fov.setRange(10, 150)
-        self.cam_fov.setValue(55)
-        self.cam_fov.setSuffix("° horiz.")
-        self.cam_fov.setEnabled(False)
-        self.cam_fov.setToolTip("Angle de champ horizontal, si vous le connaissez "
-                                "(≈ 2·atan(36 / (2 × focale en mm, équiv. 24×36)))")
-        self.cam_fov_auto.toggled.connect(lambda b: self.cam_fov.setEnabled(not b))
-        row.addWidget(self.cam_fov_auto, 1)
-        row.addWidget(self.cam_fov)
-        gl.addLayout(row)
-        self.b_cam = QPushButton("◎  Résoudre la caméra 3D")
-        self.b_cam.setObjectName("primary")
-        self.b_cam.clicked.connect(self.start_camera)
-        gl.addWidget(self.b_cam)
-        self.lbl_cam = help_label("Lancez d'abord le suivi (onglet ①).")
-        gl.addWidget(self.lbl_cam)
-        pv.addWidget(g)
-
-        g = QGroupBox("Profondeur de l'image")
-        gl = QVBoxLayout(g)
-        gl.addWidget(help_label(
-            "Carte de profondeur par IA (Depth Anything V2) pour chaque image, <b>stabilisée</b> "
-            "grâce aux points suivis (pas de scintillement) et, si la caméra 3D est résolue, "
-            "<b>calée sur la vraie géométrie</b>. Fonctionne aussi sans suivi (plage "
-            "Début/Fin). Vue : « Profondeur »."))
-        self.b_depth = QPushButton("◐  Calculer la profondeur")
-        self.b_depth.setObjectName("primary")
-        self.b_depth.clicked.connect(self.start_depth)
-        gl.addWidget(self.b_depth)
-        self.prog_3d = QProgressBar()
-        self.prog_3d.setRange(0, 1000)
-        gl.addWidget(self.prog_3d)
-        self.lbl_depth = help_label("")
-        gl.addWidget(self.lbl_depth)
-        b = QPushButton("Annuler")
-        b.clicked.connect(self.cancel_work)
-        gl.addWidget(b)
-        pv.addWidget(g)
-
-        g = QGroupBox("Utiliser la profondeur dans Resolve")
-        gl = QVBoxLayout(g)
-        gl.addWidget(help_label(
-            "<b>Sur votre plan</b> : exportez (onglet ⑤), puis dans Resolve posez l'effet "
-            "<b>OpenFX → TAPNext → TAPNext Profondeur &amp; Temps</b> sur un nœud de la page "
-            "Color. Il lit la profondeur tout seul et permet de :<br>"
-            "• <b>isoler une plage de profondeur</b> dans l'alpha → étalonner seulement le "
-            "premier plan ou seulement le fond ;<br>"
-            "• ajouter une <b>brume</b> ou un <b>flou de profondeur</b> (mise au point) ;<br>"
-            "• des effets de <b>temps</b> sur l'image : écho, slit-scan, time-slice selon la "
-            "profondeur.<br>"
-            "<b>Sur les masques</b> (en plus) : sections Profondeur, Ombre portée et Écho de "
-            "l'onglet ② Formes."))
-        pv.addWidget(g)
-        pv.addStretch(1)
-        return panel
-
-    # ------------------------------------------------------------ 3D
     def _valid_tracked(self) -> np.ndarray:
         return se.valid_mask(self.res, np.arange(self.n_tracked)) & (self.res.visibility >= 0.5)
 
     def _work_running(self) -> bool:
         return any(t is not None for t in (self.tracker_thread, self.export_thread,
-                                           self.depth_thread, self.camera_thread,
                                            getattr(self, "analyze_thread", None)))
-
-    def start_camera(self):
-        if self.res is None or not self.n_tracked or self.tracked_seg is None or self._work_running():
-            return
-        gid = self.cam_group.currentData()
-        cols = (np.arange(self.n_tracked) if gid is None or gid < 0
-                else np.nonzero(self.pgroup[:self.n_tracked] == gid)[0])
-        if len(cols) < 8:
-            QMessageBox.warning(self, APP_NAME, "Il faut au moins 8 points suivis dans le groupe.")
-            return
-        info = self.store.info
-        a, b = self.tracked_seg
-        fov = None if self.cam_fov_auto.isChecked() else float(self.cam_fov.value())
-        self.camera_thread = CameraThread(self.res.positions[:, :self.n_tracked], self._valid_tracked(),
-                                          info.width, info.height, a, b, fov, cols)
-        self.camera_thread.progress.connect(
-            lambda d, f: (self.prog_3d.setValue(int(f * 1000)), self.lbl_cam.setText(d)))
-        self.camera_thread.done.connect(self._on_camera)
-        self.camera_thread.failed.connect(self._on_failed_3d)
-        self.camera_thread.finished.connect(self._thread3d_finished)
-        self.prog_3d.setValue(0)
-        self.lbl_cam.setText("Résolution de la caméra…")
-        self._update_3d_buttons()
-        self.camera_thread.start()
-
-    def start_depth(self):
-        if not self.store or not self.store.complete or self._work_running():
-            return
-        if self.res is None or not self.n_tracked or self.tracked_seg is None:
-            # Sans suivi : plage Début/Fin, stabilisation sur les cartes elles-mêmes.
-            a, b = self.seg_in, self.seg_out
-            T = self.store.total
-            self.depth_thread = DepthThread(self.store, a, b, np.zeros((T, 0, 2), np.float32),
-                                            np.zeros((T, 0), bool), None)
-            self.depth_thread.progress.connect(self._on_progress_3d)
-            self.depth_thread.done.connect(self._on_depth)
-            self.depth_thread.failed.connect(self._on_failed_3d)
-            self.depth_thread.finished.connect(self._thread3d_finished)
-            self.prog_3d.setValue(0)
-            self._update_3d_buttons()
-            self.depth_thread.start()
-            return
-        a, b = self.tracked_seg
-        inv = None
-        if self.cam is not None and self.cam.mode == "3d":
-            z = self.cam.depth()
-            Q = self.n_tracked
-            inv = np.full((len(self.res.tracked), Q), np.nan)
-            n = min(len(z), len(inv))
-            zz = z[:n, :Q]
-            inv[:n, :zz.shape[1]] = np.where(zz > 0, 1.0 / np.where(zz > 0, zz, 1), np.nan)
-        self.depth_thread = DepthThread(self.store, a, b, self.res.positions[:, :self.n_tracked],
-                                        self._valid_tracked(), inv)
-        self.depth_thread.progress.connect(self._on_progress_3d)
-        self.depth_thread.done.connect(self._on_depth)
-        self.depth_thread.failed.connect(self._on_failed_3d)
-        self.depth_thread.finished.connect(self._thread3d_finished)
-        self.prog_3d.setValue(0)
-        self._update_3d_buttons()
-        self.depth_thread.start()
-
-    def _on_progress_3d(self, desc: str, frac: float):
-        self.prog_3d.setValue(int(frac * 1000))
-        self.lbl_depth.setText(desc)
-        self.statusBar().showMessage(f"{desc} — {frac * 100:.0f} %")
-
-    def _on_failed_3d(self, msg: str):
-        self.lbl_depth.setText(msg)
-        self.statusBar().showMessage(msg, 15000)
-        if "annulé" not in msg:
-            QMessageBox.warning(self, APP_NAME, msg)
-
-    def _thread3d_finished(self):
-        self.depth_thread = None
-        self.camera_thread = None
-        self._update_3d_buttons()
-        self._update_labels()
-
-    def _update_3d_buttons(self):
-        if not hasattr(self, "b_cam"):
-            return
-        ok = self.res is not None and self.n_tracked > 0 and not self._work_running()
-        self.b_cam.setEnabled(ok)
-        self.b_depth.setEnabled(bool(self.store and self.store.complete) and not self._work_running())
-
-    def _on_camera(self, r):
-        self.prog_3d.setValue(1000)
-        self.statusBar().showMessage("Caméra 3D : terminé.", 8000)
-        if r.mode == "échec":
-            self.cam = None
-            self.lbl_cam.setText("Échec : " + (r.message or "pas assez de mouvement ou de points."))
-        else:
-            self.cam = r
-            a, b = r.frames
-            n_ok = sum(r.ok(t) for t in range(a, b + 1))
-            n3 = int(np.isfinite(r.X[:, 0]).sum())
-            fov = math.degrees(2 * math.atan(r.width / (2 * r.focal)))
-            kind = ("Caméra 3D complète" if r.mode == "3d"
-                    else "Rotation seule (la caméra pivote sans se déplacer : pas de profondeur)")
-            self.lbl_cam.setText(
-                f"<b>{kind}</b><br>Erreur {r.rms:.2f} px · {n_ok}/{b - a + 1} images · "
-                f"{n3} points 3D · champ {fov:.1f}° (focale {r.focal:.0f} px)"
-                + (f"<br>{r.message}" if r.message and r.mode != "3d" else "")
-                + "<br>Croix cyan = points 3D reprojetés : ils doivent coller à l'image.")
-        self._update_point_depth()
-        self.viewer.update()
-
-    def _on_depth(self, clip, pd):
-        self.prog_3d.setValue(1000)
-        self.depth_clip = clip
-        self._clip_pd = pd
-        self.statusBar().showMessage("Profondeur : terminé.", 8000)
-        self.lbl_depth.setText(
-            f"Profondeur prête sur {len(clip.depth01)} images"
-            + (" · calée sur la caméra 3D" if self.cam is not None and self.cam.mode == "3d" else "")
-            + ". Choisissez la vue « Profondeur » pour la voir.")
-        self._update_point_depth()
-
-    def _update_point_depth(self):
-        """Profondeur par point utilisée par les formes : carte IA (si calculée),
-        sinon profondeur géométrique de la caméra 3D."""
-        pd = getattr(self, "_clip_pd", None) if self.depth_clip is not None else None
-        if pd is None and self.cam is not None and self.cam.mode == "3d":
-            pd = de.normalize_depth(self.cam.depth())
-        if pd is not None and self.res is not None:
-            T, Q = self.res.visibility.shape
-            full = np.full((T, Q), np.nan, np.float32)
-            n, m = min(T, pd.shape[0]), min(Q, pd.shape[1])
-            full[:n, :m] = pd[:n, :m]
-            pd = full
-        self.point_depth = pd
-        self.depth_version += 1
-        self._gcache.clear()
-        if hasattr(self, "editor"):
-            self.editor.depth_hint.setText(
-                "Profondeur disponible ✓ (0 = proche, 1 = loin)." if pd is not None else
-                "Calculez d'abord la profondeur ou la caméra 3D (onglet ④ 3D). 0 = proche, 1 = loin.")
-        self._refresh_overlay()
-
-    def cam_points_now(self) -> Optional[np.ndarray]:
-        c = self.cam
-        if c is None or self.tabs.currentIndex() != 3 or not c.ok(self.cur):
-            return None
-        X = c.X[np.isfinite(c.X[:, 0])]
-        if c.mode != "3d" or not len(X):
-            return None
-        Xc = X @ c.R[self.cur].T + c.t[self.cur]
-        X = X[Xc[:, 2] > 1e-6]
-        if not len(X):
-            return None
-        return self.view_xy(self.cur, c.project(self.cur, X))
 
     def _tab_export(self) -> QWidget:
         panel = QWidget()
@@ -2110,16 +1883,11 @@ class StudioWindow(QMainWindow):
         self.cb_fx_corner = QCheckBox("Insertion planaire 4 coins (modèle Perspective)")
         for c in (self.cb_fx_stab, self.cb_fx_mm, self.cb_fx_corner):
             gl.addWidget(c)
-        gl.addWidget(QLabel("3D (onglet ④) :"))
-        self.cb_cam3d = QCheckBox("Caméra 3D Fusion + nuage de points (.ply, .json)")
-        self.cb_cam3d.setChecked(True)
-        self.cb_cam3d.setToolTip("Nœud Camera3D animé + repères Locator3D, si la caméra est résolue")
-        gl.addWidget(self.cb_cam3d)
-        self.cb_depth_vid = QCheckBox("Vidéo de profondeur N&&B (blanc = proche)")
-        self.cb_depth_vid.setChecked(True)
-        self.cb_depth_vid.setToolTip("Si la profondeur est calculée : utilisable comme matte "
-                                     "externe ou pour un flou de profondeur")
-        gl.addWidget(self.cb_depth_vid)
+        self.cb_composite = QCheckBox("Rush masqué + effets (vidéo ; alpha si fond transparent)")
+        self.cb_composite.setChecked(True)
+        self.cb_composite.setToolTip("L'image d'origine dans les formes, avec écho, slit-scan et ombre "
+                                     "appliqués à l'image. Fond : onglet ② (Rendu final).")
+        gl.addWidget(self.cb_composite)
         self.cb_wire = QCheckBox("Brancher la stabilisation dans la comp du clip")
         self.cb_wire.setToolTip("L'image du clip est alors directement stabilisée dans Resolve.")
         self.cb_wire.setVisible(bool(self.job))
@@ -2160,7 +1928,7 @@ class StudioWindow(QMainWindow):
         return "lasso"
 
     def view_mode(self) -> str:
-        return ["points", "overlay", "matte", "depth"][self.view_combo.currentIndex()]
+        return ["points", "overlay", "matte", "composite"][self.view_combo.currentIndex()]
 
     def show_points_on_matte(self) -> bool:
         return self.cb_points_on_matte.isChecked()
@@ -2273,7 +2041,6 @@ class StudioWindow(QMainWindow):
             "Entourez le sujet avec l'outil Zone.", 15000)
         self.set_frame(self.cur, force=True)
         self.timeline.update()
-        self._update_3d_buttons()
         self._update_labels()
 
     def _ask_outdir(self):
@@ -2309,13 +2076,17 @@ class StudioWindow(QMainWindow):
             self.viewer.update()
             return
         if self.stab_preview():
+            # Rendu stabilisé au fil de travail ; l'image précédente reste affichée.
             info = self.store.info
             r = self.stab_info
-            img = sb.warp_frame(img, self.cur, self.C, info.width, info.height,
-                                L=r.L if r is not None else None,
-                                path=r.path if r is not None else None,
-                                get_frame=self.store.frame, fill=self.st_fill.isChecked(),
-                                max_dist=8, quality=False)
+            self._ptoken += 1
+            self.preview_worker.request(dict(
+                token=self._ptoken, kind="stab", t=self.cur, img=img, C=self.C,
+                src=(info.width, info.height), L=r.L if r is not None else None,
+                path=r.path if r is not None else None, get_frame=self.store.frame,
+                fill=self.st_fill.isChecked()))
+            if self.viewer.qimg is not None:
+                return
         rgb = np.ascontiguousarray(img)
         self._img_ref = rgb
         self.viewer.qimg = QImage(rgb.data, rgb.shape[1], rgb.shape[0], rgb.strides[0],
@@ -2402,15 +2173,6 @@ class StudioWindow(QMainWindow):
             self.mo_group.blockSignals(False)
             if j < 0 and cur_gid not in (None, -2):
                 self._schedule_solve()
-        if hasattr(self, "cam_group"):
-            cur_gid = self.cam_group.currentData()
-            self.cam_group.clear()
-            self.cam_group.addItem("Tous les points suivis", -1)
-            for i, g in enumerate(self.groups):
-                self.cam_group.addItem(f"{i + 1}. {g.name}", g.id)
-            j = self.cam_group.findData(cur_gid)
-            self.cam_group.setCurrentIndex(j if j >= 0 else 0)
-        self._update_3d_buttons()
         self._on_group_row(row_sel)
 
     def _on_group_row(self, row: int):
@@ -2752,24 +2514,13 @@ class StudioWindow(QMainWindow):
         self._update_labels()
 
     def cancel_work(self):
-        for t in (self.tracker_thread, self.export_thread, self.depth_thread, self.camera_thread,
-                  self.analyze_thread):
+        for t in (self.tracker_thread, self.export_thread, self.analyze_thread):
             if t is not None:
                 t.cancel.set()
 
     # ------------------------------------------------------------ rendu
     def _tracking_changed(self):
         self.res_version += 1
-        stale_d = self.point_depth is not None and (
-            self.res is None or self.point_depth.shape != self.res.visibility.shape)
-        stale_c = self.cam is not None and (self.res is None or len(self.cam.X) != self.n_tracked)
-        if stale_d or stale_c:
-            # nouveaux points : la profondeur et la caméra sont à recalculer
-            self.cam, self.depth_clip, self.point_depth, self._clip_pd = None, None, None, None
-            if hasattr(self, "lbl_cam"):
-                self.lbl_cam.setText("Le suivi a changé : relancez la caméra 3D.")
-                self.lbl_depth.setText("Le suivi a changé : relancez la profondeur.")
-                self._update_point_depth()
         self.quad_ref = None if self.res is None else self.quad_ref
         if hasattr(self, "solve_timer"):
             self._schedule_solve()
@@ -2788,16 +2539,13 @@ class StudioWindow(QMainWindow):
         if not len(cols):
             return None
         st = g.style
-        key = (self.res_version, self.depth_version, tuple(cols[:8]), len(cols), st.smooth,
+        key = (self.res_version, tuple(cols[:8]), len(cols), st.smooth,
                st.always_visible, st.fade_in_on, st.fade_in, st.fade_out_on, st.fade_out,
                st.size_jitter)
         hit = self._gcache.get(g.id)
         if hit is not None and hit[0] == key:
             return hit[1]
-        pd = self.point_depth
-        if pd is not None and pd.shape != self.res.visibility.shape:
-            pd = None
-        gd = se.prepare_group(self.res, cols, st, depth=pd)
+        gd = se.prepare_group(self.res, cols, st)
         self._gcache[g.id] = (key, gd)
         return gd
 
@@ -2808,43 +2556,39 @@ class StudioWindow(QMainWindow):
         self.render_timer.start(25)
 
     def _refresh_overlay(self):
+        """Demande le rendu de la vue au fil de travail (l'interface ne bloque
+        jamais ; seule la dernière demande est rendue)."""
         v = self.viewer
-        if ((self.res is None and self.view_mode() != "depth") or self.view_mode() == "points"
-                or not self.store or self.stab_preview() or self.tabs.currentIndex() == 2):
+        mode = self.view_mode()
+        if (self.res is None or mode == "points" or not self.store or self.stab_preview()
+                or self.tabs.currentIndex() == 2):
             v.overlay = None
             v.update()
             return
-        st, t = self.store, self.cur
-        if self.view_mode() == "depth":
-            d = self.depth_clip.frame01(t) if self.depth_clip is not None else None
-            if d is None:
-                v.overlay = None
-                self.statusBar().showMessage("Pas de profondeur pour cette image : onglet ④ 3D.", 4000)
-                v.update()
-                return
-            g8 = ((1.0 - d.astype(np.float32)) * 255).clip(0, 255).astype(np.uint8)
-            g8 = cv2.resize(g8, (st.pw, st.ph), interpolation=cv2.INTER_LINEAR)
-            col = cv2.applyColorMap(g8, cv2.COLORMAP_TURBO)
-            rgba = np.dstack([cv2.cvtColor(col, cv2.COLOR_BGR2RGB), np.full_like(g8, 255)])
-            self._ov_ref = np.ascontiguousarray(rgba)
-            v.overlay = QImage(self._ov_ref.data, st.pw, st.ph, st.pw * 4, QImage.Format_RGBA8888)
-            v.update()
+        st = self.store
+        layers = [(se.ShapeStyle.from_dict(L[0].to_dict()), L[1], L[2])
+                  for L in self.layers() if L[1] is not None]
+        self._ptoken += 1
+        self.preview_worker.request(dict(
+            token=self._ptoken, kind="overlay", mode=mode, t=self.cur, layers=layers,
+            invert=self.cb_invert.isChecked(), background=self.bg_combo.currentData(),
+            src=(st.info.width, st.info.height), size=(st.pw, st.ph), get_frame=st.frame))
+
+    def _on_preview(self, token: int, kind: str, img):
+        if token < self._pshown or img is None:
             return
-        key = (st.pw, st.ph)
-        if getattr(self, "_rkey", None) != key:
-            self._renderer = se.ShapeRenderer(st.info.width, st.info.height, st.pw, st.ph, 960)
-            self._rkey = key
-        layers = [L for L in self.layers() if L[1] is not None]
-        m = self._renderer.render(layers, t, self.cb_invert.isChecked()) if layers else \
-            np.full((st.ph, st.pw), 255 if self.cb_invert.isChecked() else 0, np.uint8)
-        if self.view_mode() == "matte":
-            v.overlay = np_to_qimage_gray(m)
+        self._pshown = token
+        v = self.viewer
+        if kind == "stab":
+            rgb = np.ascontiguousarray(img)
+            self._img_ref = rgb
+            v.qimg = QImage(rgb.data, rgb.shape[1], rgb.shape[0], rgb.strides[0], QImage.Format_BGR888)
+        elif img.ndim == 2:
+            self._ov_ref = np.ascontiguousarray(img)
+            v.overlay = np_to_qimage_gray(self._ov_ref)
         else:
-            rgba = np.zeros((m.shape[0], m.shape[1], 4), np.uint8)
-            rgba[..., 0], rgba[..., 1], rgba[..., 2] = 255, 70, 60
-            rgba[..., 3] = (m.astype(np.uint16) * 140 // 255).astype(np.uint8)
-            self._ov_ref = rgba
-            v.overlay = QImage(rgba.data, rgba.shape[1], rgba.shape[0], rgba.strides[0],
+            self._ov_ref = np.ascontiguousarray(img)
+            v.overlay = QImage(self._ov_ref.data, img.shape[1], img.shape[0], img.strides[0],
                                QImage.Format_RGBA8888)
         v.update()
 
@@ -2860,9 +2604,6 @@ class StudioWindow(QMainWindow):
         meta = dict(video=self.store.path, seg=[self.seg_in, self.seg_out], cur=self.cur,
                     n_tracked=self.n_tracked, tracked_seg=self.tracked_seg,
                     invert=self.cb_invert.isChecked(), next_gid=self._next_gid,
-                    camera=None if self.cam is None else dict(
-                        mode=self.cam.mode, rms=self.cam.rms, frames=list(self.cam.frames),
-                        width=self.cam.width, height=self.cam.height, message=self.cam.message),
                     groups=[dict(id=g.id, name=g.name, enabled=g.enabled,
                                  style=g.style.to_dict()) for g in self.groups])
         arrays = dict(pts=self.pts, qf=self.qf, pgroup=self.pgroup,
@@ -2871,13 +2612,6 @@ class StudioWindow(QMainWindow):
             r = self.res
             arrays.update(positions=r.positions, visibility=r.visibility, tracked=r.tracked,
                           query_frames=r.query_frames, cut_frames=r.cut_frames)
-        if self.cam is not None:
-            arrays.update(cam_K=self.cam.K, cam_R=self.cam.R, cam_t=self.cam.t, cam_X=self.cam.X)
-        if self.depth_clip is not None:
-            dc = self.depth_clip
-            arrays.update(depth01=dc.depth01, depth_info=np.array([dc.first, dc.lo, dc.hi]))
-            if getattr(self, "_clip_pd", None) is not None:
-                arrays.update(depth_points=self._clip_pd)
         try:
             with open(p, "wb") as f:
                 np.savez_compressed(f, **arrays)
@@ -2918,20 +2652,7 @@ class StudioWindow(QMainWindow):
             self.n_tracked = int(meta.get("n_tracked", self.res.positions.shape[1]))
             ts = meta.get("tracked_seg")
             self.tracked_seg = tuple(ts) if ts else None
-        self.cam, self.depth_clip, self._clip_pd, self.point_depth = None, None, None, None
         self._tracking_changed()
-        cm = meta.get("camera")
-        if cm and "cam_K" in z.files:
-            self.cam = cs.CameraSolve(cm["mode"], z["cam_K"], z["cam_R"], z["cam_t"], z["cam_X"],
-                                      float(cm["rms"]), tuple(cm["frames"]), int(cm["width"]),
-                                      int(cm["height"]), cm.get("message", ""))
-            self._on_camera(self.cam)
-        if "depth01" in z.files:
-            first, lo, hi = z["depth_info"]
-            d01 = z["depth01"]
-            self.depth_clip = de.DepthClip(int(first), d01, d01, float(lo), float(hi))
-            self._clip_pd = z["depth_points"] if "depth_points" in z.files else None
-            self._on_depth(self.depth_clip, self._clip_pd)
         self._update_labels()
         self._sel_changed()
         QTimer.singleShot(250, lambda: self.set_frame(int(meta.get("cur", self.seg_in)), force=True))
@@ -2944,9 +2665,9 @@ class StudioWindow(QMainWindow):
         if self.res is None:
             if self.C is None:
                 self._recompute_solve()
-            if self.C is None and self.depth_clip is None:
-                QMessageBox.warning(self, APP_NAME, "Rien à exporter : lancez le suivi (onglet ①), "
-                                    "la stabilisation (onglet ③) ou la profondeur (onglet ④).")
+            if self.C is None:
+                QMessageBox.warning(self, APP_NAME, "Rien à exporter : lancez le suivi (onglet ①) "
+                                    "ou la stabilisation (onglet ③).")
                 return
             return self._start_export_stab_only()
         out_dir = self.out_edit.text().strip()
@@ -2974,15 +2695,10 @@ class StudioWindow(QMainWindow):
         gindex = {g.id: k for k, g in enumerate(groups)}
         point_groups = np.array([gindex.get(int(v), 0) for v in self.pgroup[:self.n_tracked]], np.int32)
         fusion_jobs = self.fusion_jobs()
-        cam = self.cam if (self.cam is not None and self.cam.mode != "échec"
-                           and self.cb_cam3d.isChecked()) else None
         job = dict(
             stab_C=self.C if (self.cb_stab_video.isChecked() and self.C is not None) else None,
             **self._stab_extra(),
-            point_depth=None if self.point_depth is None else self.point_depth[:, :self.n_tracked],
-            camera=cam, cam_valid=self._valid_tracked() if cam is not None else None,
-            depth_clip=self.depth_clip, depth_video=self.cb_depth_vid.isChecked(),
-            n_total=self.store.total,
+            composite=self.cb_composite.isChecked(), background=self.bg_combo.currentData(),
             fusion_jobs=fusion_jobs, frames=list(range(self.seg_in, self.seg_out + 1)),
             info=info, res=self.res, rd=self.rd, pts=self.pts[:self.n_tracked],
             out_dir=out_dir, name=name,
@@ -3036,16 +2752,14 @@ class StudioWindow(QMainWindow):
         name = self._export_name(out_dir, self.name_edit.text().strip() or "tapnext")
         job = dict(stab_C=self.C if (self.cb_stab_video.isChecked() and self.C is not None) else None,
                    **self._stab_extra(),
-                   depth_clip=self.depth_clip, depth_video=self.cb_depth_vid.isChecked(),
-                   n_total=self.store.total,
                    fusion_jobs=self.fusion_jobs(), frames=list(range(self.seg_in, self.seg_out + 1)),
                    info=self.store.info, res=None, rd=None, out_dir=out_dir, name=name,
                    codec=["prores", "dnxhr", "h264", "png"][self.codec.currentIndex()],
                    data=False, matte=False, ref_frame=self.seg_in, job_mode=bool(self.job),
                    seg_in=int((self.job or {}).get("start", self.seg_in)))
-        if job["stab_C"] is None and not job["fusion_jobs"] and job["depth_clip"] is None:
-            QMessageBox.warning(self, APP_NAME, "Rien à exporter : stabilisation (onglet ③), "
-                                "profondeur (onglet ④) ou suivi (onglet ①).")
+        if job["stab_C"] is None and not job["fusion_jobs"]:
+            QMessageBox.warning(self, APP_NAME, "Rien à exporter : stabilisation (onglet ③) "
+                                "ou suivi (onglet ①).")
             return
         self.export_thread = ExportThread(job)
         self.export_thread.progress.connect(self._on_progress)
@@ -3077,14 +2791,11 @@ class StudioWindow(QMainWindow):
                                                  or "_matte_png" in o), ""),
                         csv=base + "_tracks.csv", outputs=outputs,
                         query_frame=job["ref_frame"], job_id=str(self.job.get("job_id", "")),
-                        fusion_mode=",".join([m for m, *_ in job["fusion_jobs"]]
-                                             + list(["camera3d"] if job.get("camera") is not None else []))
-                        or "none",
-                        depth_video=next((o for o in outputs if "_depth" in os.path.basename(o)), ""),
+                        fusion_mode=",".join(m for m, *_ in job["fusion_jobs"]) or "none",
+                        composite_video=job.get("composite_video", ""),
                         wire_stabilize=self.cb_wire.isChecked(), attach=self.cb_attach.isChecked(),
                         tapfx=job.get("tapfx", ""),
                         stabilized_video=job.get("stabilized_video", ""),
-                        tapdepth=job.get("tapdepth", ""),
                         **{f"setting_{k}": v for k, v in job.get("settings", {}).items()})
             with open(self.job["done"], "w", encoding="utf-8") as f:
                 json.dump(done, f, ensure_ascii=False, indent=1)
@@ -3127,8 +2838,8 @@ class StudioWindow(QMainWindow):
                 "La matte sera attachée au clip et le nœud Fusion ajouté.")
 
     def closeEvent(self, e):
-        for t in (self.tracker_thread, self.export_thread, self.depth_thread, self.camera_thread,
-                  self.analyze_thread):
+        self.preview_worker.stop()
+        for t in (self.tracker_thread, self.export_thread, self.analyze_thread):
             if t is not None:
                 t.cancel.set()
                 t.wait(3000)

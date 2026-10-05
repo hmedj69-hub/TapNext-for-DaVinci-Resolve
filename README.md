@@ -37,7 +37,7 @@ INSTALLER_Windows.bat, install.sh, TAPNext_Studio.bat/.sh, TAPNext_CLI.bat
 
 1. Placez la tête de lecture sur le clip à traiter, dans la page Edit ou Color.
 2. **Workspace → Scripts → TAPNext_Tracker** : **TAPNext Studio s'ouvre directement sur ce clip**. La plage de suivi est limitée à la partie utilisée dans la timeline.
-3. Dans Studio : entourez le sujet, lancez le suivi, réglez la matte. Dans ⑤, choisissez le nœud Fusion (Stabilisation ou Match-move) et l'option « Attacher la matte au clip », puis cliquez sur **Exporter et envoyer à Resolve**.
+3. Dans Studio : entourez le sujet, lancez le suivi, réglez la matte. Dans ④ Export, choisissez le nœud Fusion (Stabilisation ou Match-move) et l'option « Attacher la matte au clip », puis cliquez sur **Exporter et envoyer à Resolve**.
 4. Les résultats arrivent dans Resolve :
    - **automatiquement**, si votre Resolve affiche la petite fenêtre « TAPNext++ » à l'ouverture de Studio ;
    - sinon, il suffit de **relancer Workspace → Scripts → TAPNext_Tracker** une fois l'export terminé (Studio vous le rappelle). C'est le cas notamment sur la version gratuite de Resolve, où les scripts ne peuvent pas ouvrir de fenêtre.
@@ -68,7 +68,7 @@ Le principe est celui des stabilisateurs de référence (Resolve, Warp Stabilize
 Réglages :
 - **Lisser** (par défaut) ou **Verrouiller** (pied virtuel, caméra immobile). Si le plan bouge trop pour être verrouillé, la correction se transforme progressivement en lissage là où c'est nécessaire.
 - **Force du lissage** : environ la durée, en images, des mouvements considérés comme des tremblements. 30 (≈ 1 s) donne une caméra à l'épaule très douce, 80 et plus un effet steadicam.
-- **Recadrage maximal** : 10 % par défaut (zoom ×1,11 au plus).
+- **Recadrage maximal** : 12 % par défaut (zoom ×1,14 au plus). **Bords reconstruits** est coché par défaut.
 - **Trajectoire** lisse ou cinéma, **horizon verrouillé**, **correction locale**, **bords reconstruits** : voir ci-dessous.
 - **Position / Rotation / Échelle**, **zoom automatique**, **aperçu stabilisé** (la vue montre directement le résultat).
 - La ligne **Tremblement : avant → après** mesure le résultat en pixels par image.
@@ -109,7 +109,7 @@ Choisissez dans **Mouvement de** un groupe de points suivis par TAPNext++ (ongle
 - La **frise de temps** colore chaque image selon la qualité du calcul : vert < 0,7 px, jaune < 2 px, rouge au-delà.
 - **Insertion planaire** (modèle Perspective) : glissez les **4 coins orange** sur la surface à remplacer. Ils suivent la surface sur tout le plan.
 
-### Export (onglet ⑤)
+### Export (onglet ④)
 - **Vidéo stabilisée** `_stabilized.mov`. Dans Resolve, page Edit : glissez-la sur le clip d'origine, puis choisissez **Replace**. Grâce au même timecode, elle se cale image pour image.
 - **Nœud Fusion Stabilisation** : `Transform`, ou `CornerPositioner` en perspective. Il peut être **branché directement** dans la comp du clip.
 - **Match-move** : accroche un élément (texte, logo) au mouvement.
@@ -117,60 +117,33 @@ Choisissez dans **Mouvement de** un groupe de points suivis par TAPNext++ (ongle
 
 ---
 
-## 🧊 Tracker 3D, profondeur, ombres et échos (onglet ④ 3D de Studio)
+## 🎭 Rush masqué + effets, perspective issue du suivi
 
-### Ce que ça calcule
-- **Caméra 3D** (équivalent du *Camera Tracker* de Fusion ou de SynthEyes) : à partir des points suivis, Studio retrouve le **mouvement réel de la caméra dans l'espace** et la **position 3D de chaque point**. Technique : couple d'images initial (matrice essentielle), ajout des images par PnP RANSAC, triangulation, puis **ajustement de faisceaux** (bundle adjustment robuste). La **focale est estimée automatiquement** si vous ne la connaissez pas. Si la caméra ne fait que pivoter (panoramique sur pied), Studio le détecte et donne une caméra « rotation seule ».
-- **Profondeur de l'image** : une carte de profondeur par image avec l'IA *Depth Anything V2*. Ces réseaux scintillent d'une image à l'autre. Studio les **stabilise avec les points TAPNext++**, car un même point physique doit garder la même profondeur. Si la caméra 3D est résolue, les cartes sont **calées sur la vraie géométrie** des points 3D.
-- **Profondeur de chaque point**, à chaque image : c'est ce qu'utilisent les formes (perspective, plage de profondeur, brume, ombres, time-slice).
+### Rush masqué + effets
+Les effets s'appliquent à **l'image du rush dans les formes**, pas seulement au masque :
+- **Écho** : les images passées du sujet masqué se superposent et s'estompent (traînées fantômes de l'image réelle).
+- **Slit-scan** horizontal, vertical ou radial : chaque zone du masque montre le sujet à un autre instant.
+- **Ombre portée** : l'ombre du sujet découpé tombe sur le fond.
 
-TAPNext++ convient bien à ce travail : ses pistes sont **longues** et survivent aux occultations, ce qui donne beaucoup d'observations par point (le solveur 3D en a besoin). Le flux optique sous-pixel garde l'erreur de reprojection basse. Sa faiblesse, des points qui glissent sur les objets en mouvement, est filtrée par RANSAC et par l'ajustement robuste.
+Dans Studio : vue **« Rush masqué (rendu final) »**, onglet ② → **Rendu final** → **Fond du rush masqué** :
+- **Transparent** : alpha, à poser au-dessus d'un autre plan ;
+- **Noir** ;
+- **Rush original** : les échos du sujet passent par-dessus le plan normal ;
+- **Rush assombri** ;
+- **Rush flou**.
 
-### Utilisation
-1. **① Suivi** : pour la caméra, posez une zone de points sur le **décor fixe**, bien répartie (avant-plan et fond). Pour jouer avec des formes, posez aussi vos groupes sur les sujets.
-2. **④ 3D** :
-   - **Résoudre la caméra 3D** : choisissez le groupe du décor. Laissez *Focale automatique* cochée, ou entrez l'angle de champ s'il est connu. Les **croix cyan** sont les points 3D reprojetés : elles doivent coller à l'image. L'erreur doit idéalement rester sous 1 px.
-   - **Calculer la profondeur** : environ 0,1 s par image sur la RTX 3080. Le modèle (~100 Mo) est téléchargé au premier usage. Vue **« Profondeur »** : rouge = proche, bleu = loin.
-3. **② Formes** : chaque groupe a trois nouvelles sections (voir le tableau plus bas). Pour démarrer, essayez les préréglages **Profondeur + ombre**, **Échos fantômes** et **Slit-scan**.
-4. **⑤ Export** :
-   - **Caméra 3D Fusion** : nœud `TAP_Camera3D` animé, avec ouverture et focale, plus des repères `TAP_Point3D` (Locator3D) sur des points réels de la scène. Depuis Resolve, ils sont collés dans la comp du clip. Reliez la caméra et vos objets 3D à un `Merge3D`, puis à un `Renderer3D` : les objets restent collés à la scène.
-   - Fichiers `_points3d.ply` (nuage de points, pour Blender ou d'autres logiciels) et `_camera.json` (caméra par image).
-   - **Vidéo de profondeur** `_depth.mov` (blanc = proche), importée dans le chutier TAPNext. Elle sert de matte externe pour isoler un plan de profondeur, ou de carte pour un flou de profondeur.
-   - Le fichier `.tapfx` contient la profondeur de chaque point : l'effet OFX dispose des mêmes réglages de profondeur, d'ombre et d'écho.
+Export : **Rush masqué + effets** → `_masque.mov`, en ProRes 4444 **avec alpha** quand le fond est transparent. Le fichier est importé dans le chutier TAPNext.
 
-### Effets créatifs
-| Effet | Réglages | Idée |
-|---|---|---|
-| **Perspective** | Profondeur → Perspective | Les formes rapetissent avec la distance, comme de vrais objets. |
-| **Plage de profondeur** | Garder à partir de / jusqu'à, fondu | Masque seulement le premier plan, ou seulement le fond, avec une transition douce. |
-| **Brume** | Brume | Les formes lointaines s'effacent. |
-| **Ombre portée** | Direction, distance, flou, opacité | Ombre douce derrière le masque. Avec *Distance selon la profondeur*, les formes proches projettent une ombre plus éloignée : effet de relief. |
-| **Écho temporel** | Nombre, intervalle, atténuation, échelle | Copies passées du masque qui se superposent et s'estompent : traînées fantômes, effet stroboscopique. |
-| **Slit-scan** | Horizontal, vertical ou radial, décalage max. | Chaque bande de l'image montre un instant différent : déformation temporelle façon *2001*. |
-| **Time-slice par profondeur** | Décalage max. | Le premier plan est en avance sur le fond : le masque se « déplie » dans la profondeur. |
+Dans Resolve : effet **TAPNext Shapes**, **Sortie = Rush masqué + effets**, avec le réglage **Fond du rush masqué**. L'effet lit lui-même les images précédentes du clip pour les échos et le slit-scan.
 
-> Limites : la caméra 3D a besoin d'un **déplacement** de la caméra (parallaxe). Un plan fixe ou un panoramique pur ne donne pas de profondeur géométrique, mais la profondeur IA reste disponible. Les objets qui bougent dans la scène ne doivent pas servir au calcul de la caméra : utilisez un groupe posé sur le décor.
+### Perspective et profondeur déduites du suivi TAPNext
+Cochez **Épouser la perspective de la surface** (onglet ② → Forme). Chaque forme se déforme comme la surface sous elle : elle rapetisse quand la surface s'éloigne, grandit quand elle s'approche, se raccourcit quand elle tourne. Aucune IA n'intervient. Pour chaque point, la déformation de ses 8 voisins suivis par TAPNext++ entre l'image de pose et chaque image donne une matrice locale (échelle, rotation, raccourci de perspective), lissée dans le temps.
 
----
+Cette même mesure donne une **profondeur relative**, utilisée par :
+- **Ombre portée → Distance selon la profondeur** : quand la surface s'approche, l'ombre s'éloigne d'elle ;
+- **Time-slice selon la profondeur** : les parties qui s'approchent ou s'éloignent ne vivent pas au même instant.
 
-## 🌫️ Effet OFX « TAPNext Profondeur & Temps » (sur l'image, dans Resolve)
-
-Ce second effet agit **directement sur votre plan**, pas sur les masques.
-
-1. Dans Studio, onglet **④ 3D** : **Calculer la profondeur**. Le suivi n'est pas nécessaire, mais il améliore la stabilité de la profondeur. Ensuite, **Exportez** (onglet ⑤). Studio écrit un fichier `.tapdepth` et le mémorise comme « dernier export ».
-2. Dans Resolve, page **Color** : glissez **Effets → OpenFX → TAPNext → TAPNext Profondeur & Temps** sur un nœud. Le fichier de profondeur se remplit tout seul.
-
-| Section | Ce que ça fait |
-|---|---|
-| **Isoler une plage de profondeur** | La plage choisie (ex. de 0 à 0,3 = premier plan) sort dans l'**alpha** du nœud. Reliez cette sortie à l'entrée Key d'un nœud pour étalonner **seulement le premier plan** ou **seulement le fond** (option *Inverser*). Avec la sortie *Matte de la plage*, vous voyez la matte en N&B. |
-| **Brume / atmosphère** | Voile coloré qui augmente avec la distance (perspective atmosphérique, brouillard). |
-| **Flou de profondeur** | Mise au point virtuelle : *Distance nette* (0 = premier plan, 1 = fond), *Profondeur de champ*, *Flou maximal*. |
-| **Temps** | **Écho** : traînées des images précédentes, en mélange Moyenne, Plus clair ou Écran. **Slit-scan** horizontal, vertical ou radial : chaque zone de l'image montre un instant différent. **Time-slice selon la profondeur** : le premier plan et le fond ne sont pas au même instant. Option *Seulement dans la plage de profondeur*. |
-| **Mélange avec l'original** | Dose l'effet. |
-
-Sortie *Carte de profondeur* : la profondeur en N&B (blanc = proche).
-
-> Les effets de temps lisent les images voisines du clip. Comme pour tout effet temporel, le premier rendu d'une image est plus lent.
+Test sur une surface plane qui tourne et recule : sans perspective, les formes gardent leur taille et se chevauchent ; avec, elles rapetissent et se raccourcissent comme la surface.
 
 ---
 
@@ -185,19 +158,19 @@ L'installateur ajoute un **vrai effet OpenFX** dans DaVinci Resolve. Toutes les 
 | Section | Réglages |
 |---|---|
 | Suivi TAPNext | Fichier `.tapfx` · **Groupe** (numéro affiché dans la liste de Studio, 0 = tous les points) · Décalage d'image · Sortie · Afficher les points |
-| Forme | Forme (cercle, carré, carré arrondi, losange, triangle, hexagone, étoile, croix, anneau, image PNG) · image de forme · taille · **largeur** · **hauteur** · opacité · rotation · orienter selon le mouvement · variation de taille |
+| Forme | Forme (cercle, carré, carré arrondi, losange, triangle, hexagone, étoile, croix, anneau, image PNG) · image de forme · taille · **largeur** · **hauteur** · opacité · rotation · orienter selon le mouvement · variation de taille · **épouser la perspective** + intensité |
 | Réaction au mouvement | Grossir avec la vitesse · étirer dans la direction · agrandissement maximal |
 | Apparition | **Toujours visible** · fondu d'apparition (activable, durée) · fondu de disparition (activable, durée) |
 | Fusion et bords | Fusion des formes · seuil · douceur |
 | Effets | Traînée · lissage des trajectoires · inverser la matte |
-| Profondeur | Taille selon la profondeur · profondeur min./max. · fondu de la plage · brume (nécessite un export avec profondeur) |
-| Ombre portée | Ombre · direction · distance · flou · opacité · distance selon la profondeur |
+| Ombre portée | Ombre · direction · distance · flou · opacité · distance selon la profondeur (déduite du suivi) |
 | Écho temporel / slit-scan | Mode (écho, slit-scan horizontal/vertical/radial, time-slice selon la profondeur) · nombre · intervalle · atténuation · échelle · décalage max. |
 
 **Sortie** :
 - **Image + alpha** (par défaut) : l'image ne change pas et la matte est dans l'alpha. Dans la page Color, utilisez la sortie Key du nœud, ou mettez l'effet dans un nœud et reliez son alpha à l'entrée Key du nœud de correction.
 - **Matte N&B** : la matte en blanc sur noir.
 - **Aperçu** : les formes en rouge sur l'image.
+- **Rush masqué + effets** : l'image dans les formes, avec écho, slit-scan et ombre appliqués à l'image ; **Fond du rush masqué** : transparent (alpha), noir, rush original ou assombri.
 
 Pour donner un style différent à chaque groupe, posez un effet par groupe, chacun avec son numéro de groupe.
 
@@ -211,7 +184,7 @@ Installation : `INSTALLER_Windows.bat` copie l'effet dans `C:\Program Files\Comm
 
 ## 🖥️ TAPNext Studio, pas à pas
 
-Le panneau de droite a cinq onglets : **① Suivi**, **② Formes**, **③ Stabiliser**, **④ 3D** et **⑤ Export**.
+Le panneau de droite a quatre onglets : **① Suivi**, **② Formes**, **③ Stabiliser** et **④ Export**. Le rendu de la vue se fait en arrière-plan : l'interface reste fluide pendant la lecture.
 
 | Étape | Ce que vous faites | Ce qui se passe |
 |---|---|---|
@@ -219,8 +192,8 @@ Le panneau de droite a cinq onglets : **① Suivi**, **② Formes**, **③ Stabi
 | **Suivre** (①) | Réglez Début/Fin (**I**/**O**), puis **Lancer le suivi**. | Suivi **vers l'avant et vers l'arrière**, avec **contrôle aller-retour** : les points qui décrochent sont coupés à l'image exacte du décrochage. Si vous ajoutez des points ensuite, seuls les nouveaux sont suivis. |
 | **Formes** (②) | Choisissez un groupe dans la liste et réglez son style. Utilisez un **préréglage** pour démarrer vite. | Le rendu est en direct dans la vue « Image + matte » ou « Matte seule ». Le suivi n'est jamais recalculé. |
 | **Éditer à part** (②) | Outil **Sélection** (S) : glissez sur des points (**Maj** pour ajouter), puis **Nouveau groupe avec la sélection**. | Ces points ont désormais leur propre style. Par exemple, des étoiles sur une partie du sujet et des blobs ailleurs. |
-| **3D** (④) | Résolvez la caméra 3D et/ou calculez la profondeur. | Les formes peuvent ensuite réagir à la profondeur (voir la section Tracker 3D). |
-| **Exporter** (⑤) | Choisissez dossier, format, et éventuellement « une matte par groupe », les nœuds Fusion et la vidéo de contrôle. | La matte est rendue en pleine résolution (1080p ou 4K), et les CSV, JSON et `.setting` sont écrits. |
+| **Rush masqué** (②) | Vue « Rush masqué (rendu final) », fond au choix. | L'image dans les formes, avec les effets appliqués à l'image. |
+| **Exporter** (④) | Choisissez dossier, format, et éventuellement « une matte par groupe », les nœuds Fusion et la vidéo de contrôle. | La matte est rendue en pleine résolution (1080p ou 4K), et les CSV, JSON et `.setting` sont écrits. |
 
 **Projet** : **Enregistrer le projet** (Ctrl+S) crée un fichier `.tapnext` qui contient les points, le suivi et les formes. Pour le rouvrir : **Ouvrir…**, ou glissez le fichier sur la fenêtre. Rien n'est à recalculer.
 
@@ -234,6 +207,7 @@ Le panneau de droite a cinq onglets : **① Suivi**, **② Formes**, **③ Stabi
 | | **Largeur / Hauteur** | Étirent la forme : un carré devient un rectangle, un cercle une ellipse. |
 | | Orienter dans le sens du mouvement | La forme tourne pour suivre la direction du point. |
 | | Variation aléatoire de taille | Chaque point reçoit une taille légèrement différente, pour un rendu organique. |
+| | **Épouser la perspective** + intensité | La forme se déforme comme la surface suivie (taille, raccourci). |
 | Réaction au mouvement | Grossir avec la vitesse | La forme grossit quand le point va vite. |
 | | Étirer dans la direction | La forme s'allonge dans le sens du mouvement. |
 | | Agrandissement maximal | Limite des deux effets précédents. |
@@ -243,9 +217,8 @@ Le panneau de droite a cinq onglets : **① Suivi**, **② Formes**, **③ Stabi
 | | Seuil, Douceur du bord | Taille de la fusion et adoucissement du contour. |
 | Effets | Traînée dans la matte | La forme laisse une traînée qui s'estompe sur N images. |
 | | Lissage des trajectoires | Supprime les micro-tremblements. |
-| Profondeur | Perspective, plage gardée, fondu, brume | Nécessite l'onglet ④ 3D. 0 = proche, 1 = loin. |
 | Ombre portée | Direction, distance, flou, opacité, selon la profondeur | Ombre douce derrière les formes. |
-| Écho temporel / slit-scan | Mode, nombre, intervalle, atténuation, échelle, décalage max. | Superpose le masque dans le temps (échos, slit-scan, time-slice). |
+| Écho temporel / slit-scan | Mode, nombre, intervalle, atténuation, échelle, décalage max. | Masque : superpose les formes dans le temps. Rush masqué : superpose l'image du sujet. |
 
 Les **valeurs par défaut** reprennent vos réglages : taille 4 px, fusion 0,10, seuil 0,10, douceur 0, grossir 0,1, étirer 0,195, fondus désactivés, lissage 2,1 et matte finale inversée. Le bouton **Style par défaut** enregistre le style courant pour les prochains groupes.
 

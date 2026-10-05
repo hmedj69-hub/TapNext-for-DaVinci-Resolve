@@ -559,26 +559,22 @@ function M.import_results(resolve, root, job_text, done_text)
       report[#report + 1] = "✘ Import de la vidéo stabilisée impossible (" .. tostring(why) .. ") : " .. stab
     end
   end
-  local depth = M.json_field(done_text, "depth_video")
-  if depth and depth ~= "" then
-    local okd, why = M.import_to_bin(resolve, depth)
-    if okd then
-      report[#report + 1] = "✔ Vidéo de profondeur (blanc = proche) dans le chutier « TAPNext »."
+  local comp_v = M.json_field(done_text, "composite_video")
+  if comp_v and comp_v ~= "" then
+    local okc, why = M.import_to_bin(resolve, comp_v)
+    if okc then
+      report[#report + 1] = "✔ Rush masqué + effets dans le chutier « TAPNext » (alpha si fond " ..
+        "transparent) : posez-le sur une piste au-dessus du plan."
     else
-      report[#report + 1] = "✘ Import de la vidéo de profondeur impossible (" .. tostring(why) .. ") : " .. depth
+      report[#report + 1] = "✘ Import du rush masqué impossible (" .. tostring(why) .. ") : " .. comp_v
     end
-  end
-  local tapdepth = M.json_field(done_text, "tapdepth")
-  if tapdepth and tapdepth ~= "" then
-    report[#report + 1] = "✔ Profondeur prête pour l'effet OFX « TAPNext Profondeur & Temps » " ..
-      "(Effets → OpenFX → TAPNext, sur un nœud de la page Color) : plage de profondeur dans " ..
-      "l'alpha, brume, flou de profondeur, écho, slit-scan, time-slice."
   end
   local tapfx = M.json_field(done_text, "tapfx")
   if tapfx and tapfx ~= "" then
     report[#report + 1] = "✔ Suivi prêt pour l'effet OFX « TAPNext Shapes » : Effets → OpenFX → " ..
       "TAPNext → TAPNext Shapes (posé sur un nœud de la page Color ou sur le clip). " ..
-      "Le fichier de suivi est rempli automatiquement ; réglez les formes dans l'Inspecteur."
+      "Le fichier de suivi est rempli automatiquement ; réglez les formes dans l'Inspecteur " ..
+      "(Sortie « Rush masqué + effets » pour l'écho, le slit-scan et l'ombre sur l'image)."
   end
   local labels = { stabilize = "TAP_Stabilize (stabilisation)", matchmove = "TAP_MatchMove (match-move)",
     cornerpin = "TAP_CornerPin (insertion 4 coins)",

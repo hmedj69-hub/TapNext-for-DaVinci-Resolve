@@ -206,6 +206,8 @@ class MatteWriter:
         # nom: (extension, arguments ffmpeg)
         "prores": (".mov", ["-c:v", "prores_ks", "-profile:v", "3",
                             "-vendor", "apl0", "-pix_fmt", "yuv422p10le"]),
+        "prores4444": (".mov", ["-c:v", "prores_ks", "-profile:v", "4", "-vendor", "apl0",
+                                "-pix_fmt", "yuva444p10le", "-alpha_bits", "16"]),
         "dnxhr": (".mov", ["-c:v", "dnxhd", "-profile:v", "dnxhr_hq",
                            "-pix_fmt", "yuv422p"]),
         "h264": (".mp4", ["-c:v", "libx264", "-preset", "medium", "-crf", "8",
@@ -213,9 +215,10 @@ class MatteWriter:
     }
 
     def __init__(self, out_base: str, info: VideoInfo, codec: str = "prores",
-                 suffix: str = "_matte", gray: bool = True):
+                 suffix: str = "_matte", gray: bool = True, channels: Optional[int] = None):
         self.info = info
         self.gray = gray
+        self.channels = channels or (1 if gray else 3)
         self.count = 0
         self.proc: Optional[subprocess.Popen] = None
         self.png_dir: Optional[str] = None
@@ -232,7 +235,7 @@ class MatteWriter:
         ext, cargs = self.CODECS[codec]
         self.path = out_base + suffix + ext
         cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-               "-f", "rawvideo", "-pix_fmt", "gray" if gray else "bgr24",
+               "-f", "rawvideo", "-pix_fmt", {1: "gray", 3: "bgr24", 4: "bgra"}[self.channels],
                "-s", f"{info.width}x{info.height}",
                "-r", info.fps_rational or str(info.fps), "-i", "-",
                *cargs]

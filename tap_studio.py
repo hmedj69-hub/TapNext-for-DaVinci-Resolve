@@ -480,7 +480,8 @@ class ExportThread(QThread):
                                                         cancel=self.cancel))
             if j.get("stab_C") is not None:
                 # Vidéo stabilisée pleine résolution (même durée et timecode que la source).
-                p = sb.render_video(base, info, j["codec"], j["stab_C"],
+                p = sb.render_video(base, info, j["codec"], j["stab_C"], L=j.get("stab_L"),
+                                    path=j.get("stab_path"), fill=j.get("stab_fill", False),
                                     progress=self.progress.emit, cancel=self.cancel)
                 outputs.append(p)
                 j["stabilized_video"] = p
@@ -1505,6 +1506,34 @@ class StudioWindow(QMainWindow):
                                    "est adoucie localement au lieu de zoomer tout le plan.")
         self.st_crop.changed.connect(self._schedule_solve)
         gl.addWidget(self.st_crop)
+        self.st_style = QComboBox()
+        self.st_style.addItems(["Trajectoire lisse (comme Resolve)",
+                                "Trajectoire cinéma : plans fixes, panos réguliers, départs doux"])
+        self.st_style.setToolTip("Cinéma : optimisation L1 (comme le stabilisateur de YouTube) — la "
+                                 "caméra reste immobile quand c'est possible, sinon bouge à vitesse "
+                                 "constante avec des accélérations douces.")
+        self.st_style.currentIndexChanged.connect(self._schedule_solve)
+        gl.addWidget(self.st_style)
+        self.st_horizon = QCheckBox("Horizon verrouillé")
+        self.st_horizon.setToolTip("L'horizon garde l'angle de l'image de référence (+ inclinaison)")
+        self.st_horizon.toggled.connect(self._schedule_solve)
+        gl.addWidget(self.st_horizon)
+        self.st_horizon_deg = ValueSlider("Inclinaison de l'horizon (°)", -20, 20, 0, 0.1, "{:.1f}",
+                                          "Redresse l'horizon de l'image de référence")
+        self.st_horizon_deg.changed.connect(self._schedule_solve)
+        gl.addWidget(self.st_horizon_deg)
+        self.st_local = QCheckBox("Correction locale : gélatine (rolling shutter) et parallaxe")
+        self.st_local.setChecked(True)
+        self.st_local.setToolTip("Maillage 16×9 déformé image par image (méthode MeshFlow) : corrige "
+                                 "ce qu'une transformation globale ne peut pas corriger. Mode "
+                                 "Automatique uniquement.")
+        self.st_local.toggled.connect(self._schedule_solve)
+        gl.addWidget(self.st_local)
+        self.st_fill = QCheckBox("Bords reconstruits avec les images voisines (moins de zoom)")
+        self.st_fill.setToolTip("Les zones qui sortent du cadre sont remplies avec les images "
+                                "précédentes et suivantes, recalées : stabilisation quasi plein cadre.")
+        self.st_fill.toggled.connect(self._schedule_solve)
+        gl.addWidget(self.st_fill)
         row = QHBoxLayout()
         self.st_pos, self.st_rot, self.st_scale = (QCheckBox("Position"), QCheckBox("Rotation"),
                                                    QCheckBox("Échelle"))
@@ -1604,7 +1633,9 @@ class StudioWindow(QMainWindow):
         model = self.motion_model()
         W, H = self.store.info.width, self.store.info.height
         auto = gid == -2 and model != "perspective"
+        hybrid = False
         self.st_excl.setEnabled(gid == -2)
+        self.st_local.setEnabled(auto)
         self.st_smooth.setEnabled(self.st_mode.currentIndex() == 0)
         if auto:
             a, b = self.seg_in, self.seg_out
@@ -1657,6 +1688,17 @@ class StudioWindow(QMainWindow):
             ref = self.mo_ref.value()
             self.solve = ms.solve_motion(self.res.positions, valid, ref, a, b, model,
                                          ransac_px=max(1.5, 0.0015 * max(W, H)), cols=cols)
+            if model != "perspective":
+                # Hybride : précision image par image du flux optique dense +
+                # calage sans dérive des trajectoires TAPNext.
+                key = (self.store.path, a, b, False, 0)
+                if self.motion is not None and self.motion_key == key:
+                    fused = sb.fuse_paths(sb.path_from_motion(self.motion, ref), self.solve.H, W, H)
+                    self.solve = ms.Solve(fused, self.solve.inliers, self.solve.rms, self.solve.method,
+                                          ref, model, (a, b))
+                    hybrid = True
+                elif self.tabs.currentIndex() == 2 and self.analyze_thread is None:
+                    self._start_analysis(a, b, key)
         lock = self.st_mode.currentIndex() == 1
         if model == "perspective":
             st = ms.StabSettings(smooth=0 if lock else self.st_smooth.value(),
@@ -1670,8 +1712,14 @@ class StudioWindow(QMainWindow):
                                 position=self.st_pos.isChecked(),
                                 rotation=self.st_rot.isChecked() and not trans,
                                 scale=self.st_scale.isChecked() and not trans,
-                                zoom=self.st_zoom.isChecked())
-            r = sb.stabilize(self.solve.H, W, H, prm, ref=self.solve.ref)
+                                zoom=self.st_zoom.isChecked(),
+                                style="cinema" if self.st_style.currentIndex() == 1 else "smooth",
+                                horizon=self.st_horizon.isChecked() and not trans,
+                                horizon_deg=self.st_horizon_deg.value(),
+                                local=self.st_local.isChecked() and auto,
+                                fill=self.st_fill.isChecked())
+            r = sb.stabilize(self.solve.H, W, H, prm, ref=self.solve.ref,
+                             motion=self.motion if auto else None)
             self.C, self.zoom, self.stab_info = r.C, r.zoom, r
         if self.quad_ref is None:
             self._reset_quad(redraw=False)
@@ -1688,6 +1736,9 @@ class StudioWindow(QMainWindow):
             r = self.stab_info
             n_red = int((r.strength[a:b + 1] < 0.98).sum())
             txt += (f"<br><b>Tremblement : {r.shake_before:.2f} → {r.shake_after:.2f} px/image</b>"
+                    + (f" · gélatine/vibration locale : {r.wobble_before:.2f} → {r.wobble_after:.2f} px"
+                       if np.isfinite(r.wobble_before) else "")
+                    + (" · hybride TAPNext (sans dérive)" if not auto and hybrid else "")
                     + (f" · correction adoucie sur {n_red} image(s) (limite de recadrage)" if n_red else ""))
         if self.st_zoom.isChecked():
             txt += f" · zoom ×{self.zoom:.3f}"
@@ -2258,11 +2309,13 @@ class StudioWindow(QMainWindow):
             self.viewer.update()
             return
         if self.stab_preview():
-            s = self.store.scale
-            S = np.diag([s, s, 1.0])
-            Mv = S @ self.C[self.cur] @ np.linalg.inv(S)
-            img = cv2.warpPerspective(img, Mv, (img.shape[1], img.shape[0]),
-                                      flags=cv2.INTER_LINEAR, borderValue=(0, 0, 0))
+            info = self.store.info
+            r = self.stab_info
+            img = sb.warp_frame(img, self.cur, self.C, info.width, info.height,
+                                L=r.L if r is not None else None,
+                                path=r.path if r is not None else None,
+                                get_frame=self.store.frame, fill=self.st_fill.isChecked(),
+                                max_dist=8, quality=False)
         rgb = np.ascontiguousarray(img)
         self._img_ref = rgb
         self.viewer.qimg = QImage(rgb.data, rgb.shape[1], rgb.shape[0], rgb.strides[0],
@@ -2925,6 +2978,7 @@ class StudioWindow(QMainWindow):
                            and self.cb_cam3d.isChecked()) else None
         job = dict(
             stab_C=self.C if (self.cb_stab_video.isChecked() and self.C is not None) else None,
+            **self._stab_extra(),
             point_depth=None if self.point_depth is None else self.point_depth[:, :self.n_tracked],
             camera=cam, cam_valid=self._valid_tracked() if cam is not None else None,
             depth_clip=self.depth_clip, depth_video=self.cb_depth_vid.isChecked(),
@@ -2959,6 +3013,11 @@ class StudioWindow(QMainWindow):
         self.prog_exp.setValue(0)
         self.export_thread.start()
 
+    def _stab_extra(self) -> dict:
+        r = self.stab_info
+        return dict(stab_L=r.L if r is not None else None, stab_path=r.path if r is not None else None,
+                    stab_fill=self.st_fill.isChecked())
+
     def _export_name(self, out_dir: str, name: str) -> str:
         if self.job:
             base, k = name, 2
@@ -2976,6 +3035,7 @@ class StudioWindow(QMainWindow):
             return
         name = self._export_name(out_dir, self.name_edit.text().strip() or "tapnext")
         job = dict(stab_C=self.C if (self.cb_stab_video.isChecked() and self.C is not None) else None,
+                   **self._stab_extra(),
                    depth_clip=self.depth_clip, depth_video=self.cb_depth_vid.isChecked(),
                    n_total=self.store.total,
                    fusion_jobs=self.fusion_jobs(), frames=list(range(self.seg_in, self.seg_out + 1)),

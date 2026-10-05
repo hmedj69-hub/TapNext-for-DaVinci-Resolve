@@ -69,10 +69,31 @@ Réglages :
 - **Lisser** (par défaut) ou **Verrouiller** (pied virtuel, caméra immobile). Si le plan bouge trop pour être verrouillé, la correction se transforme progressivement en lissage là où c'est nécessaire.
 - **Force du lissage** : environ la durée, en images, des mouvements considérés comme des tremblements. 30 (≈ 1 s) donne une caméra à l'épaule très douce, 80 et plus un effet steadicam.
 - **Recadrage maximal** : 10 % par défaut (zoom ×1,11 au plus).
+- **Trajectoire** lisse ou cinéma, **horizon verrouillé**, **correction locale**, **bords reconstruits** : voir ci-dessous.
 - **Position / Rotation / Échelle**, **zoom automatique**, **aperçu stabilisé** (la vue montre directement le résultat).
 - La ligne **Tremblement : avant → après** mesure le résultat en pixels par image.
 
-Mesuré sur un plan à l'épaule de test (panoramique + tremblements, sujet de 25 % de l'image qui traverse le champ) : **4,9 px → 0,03 px par image**, avec un zoom de ×1,07. La mesure est faite sur la vidéo rendue.
+### Au-delà des stabilisateurs classiques
+| Option | Ce que ça fait | Équivalent |
+|---|---|---|
+| **Correction locale** (cochée par défaut) | Un maillage de 16×9 cellules est déformé image par image : il corrige la **gélatine du rolling shutter** (lignes lues à des instants différents) et les vibrations de **parallaxe** (premier plan et fond qui ne bougent pas pareil), ce qu'aucune transformation globale ne peut faire. La parallaxe lente, c'est-à-dire le relief de la scène, est conservée. | MeshFlow (Liu et al.), « Subspace Warp » de Warp Stabilizer |
+| **Bords reconstruits** | Les zones qui sortent du cadre sont remplies avec les images voisines, recalées par le mouvement de caméra. La correction n'est plus limitée par le recadrage, et le zoom reste minimal. | Stabilisation « plein cadre » (Matsushita et al.) |
+| **Trajectoire cinéma** | Optimisation L1 de la trajectoire : vrais plans fixes, panoramiques à vitesse constante, départs et arrêts en douceur, au lieu d'un simple lissage. | Stabilisateur de YouTube (Grundmann et al.) |
+| **Horizon verrouillé** + inclinaison | La rotation est figée sur l'image de référence et redressée de l'angle choisi. | Gimbal / horizon leveling |
+| **Hybride TAPNext** (mode « Points TAPNext », automatique) | La précision image par image du flux optique dense est combinée aux trajectoires longues de TAPNext++ (calage direct sur l'image de référence) : **aucune dérive**, même sur un verrouillage de plusieurs minutes. | — |
+
+Mesures sur des plans de test, faites sur la vidéo rendue :
+
+| Plan | Source | Lisse (v1) | + correction locale + bords reconstruits |
+|---|---|---|---|
+| À l'épaule + sujet qui traverse (1280×720) | 4,9 px | 0,03 px, zoom ×1,07 | 0,03 px, zoom ×1,02 |
+| **Rolling shutter + parallaxe** (960×540) | tremblement 8,1 px · gélatine 0,86 px | 1,31 px · 0,85 px, zoom ×1,11 | **0,10 px · 0,18 px, zoom ×1,03** |
+
+Le rendu prend environ 20 à 60 ms par image en 1080p sur le processeur.
+
+Fusion hybride, sur une trajectoire simulée de 600 images : le flux optique seul dérive de 6,3 px (bruit 0,05 px/image). TAPNext seul ne dérive pas, mais il est plus bruité (0,34 px/image). L'**hybride** garde le meilleur des deux : dérive de 0,6 px, bruit de 0,05 px/image.
+
+> Le nœud Fusion exporté contient la correction globale. La correction locale et les bords reconstruits ne se trouvent que dans la **vidéo stabilisée** rendue.
 
 ### Suivre un sujet, une surface ou verrouiller sans dérive (points TAPNext)
 Choisissez dans **Mouvement de** un groupe de points suivis par TAPNext++ (onglet ①).

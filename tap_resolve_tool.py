@@ -48,7 +48,7 @@ import sys
 import time
 from dataclasses import dataclass
 from fractions import Fraction
-from typing import Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Callable, Iterator, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -97,6 +97,9 @@ CHECKPOINT_URLS = {
           "https://storage.googleapis.com/gresearch/tapnextpp/tapnextpp_512.ckpt"),
 }
 
+# Sous Windows, aucune fenêtre de console pour ffmpeg/ffprobe.
+NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform.startswith("win") else {}
+
 # Espace de coordonnées des prédictions TAPNext++ (toujours 256×256, quelle que
 # soit la résolution d'entrée : voir tapnet/tapnextpp/votsp2026/model.py).
 MODEL_COORD_SIZE = 256
@@ -138,7 +141,7 @@ def _probe_timecode(path: str) -> Optional[str]:
         out = subprocess.run(
             [ffprobe, "-v", "error", "-show_entries",
              "format_tags=timecode:stream_tags=timecode", "-of", "json", path],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=30, **NO_WINDOW,
         ).stdout
         data = json.loads(out or "{}")
         for s in data.get("streams", []):
@@ -203,6 +206,8 @@ class MatteWriter:
         # nom: (extension, arguments ffmpeg)
         "prores": (".mov", ["-c:v", "prores_ks", "-profile:v", "3",
                             "-vendor", "apl0", "-pix_fmt", "yuv422p10le"]),
+        "prores4444": (".mov", ["-c:v", "prores_ks", "-profile:v", "4", "-vendor", "apl0",
+                                "-pix_fmt", "yuva444p10le", "-alpha_bits", "16"]),
         "dnxhr": (".mov", ["-c:v", "dnxhd", "-profile:v", "dnxhr_hq",
                            "-pix_fmt", "yuv422p"]),
         "h264": (".mp4", ["-c:v", "libx264", "-preset", "medium", "-crf", "8",
@@ -210,9 +215,10 @@ class MatteWriter:
     }
 
     def __init__(self, out_base: str, info: VideoInfo, codec: str = "prores",
-                 suffix: str = "_matte", gray: bool = True):
+                 suffix: str = "_matte", gray: bool = True, channels: Optional[int] = None):
         self.info = info
         self.gray = gray
+        self.channels = channels or (1 if gray else 3)
         self.count = 0
         self.proc: Optional[subprocess.Popen] = None
         self.png_dir: Optional[str] = None
@@ -229,7 +235,7 @@ class MatteWriter:
         ext, cargs = self.CODECS[codec]
         self.path = out_base + suffix + ext
         cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-               "-f", "rawvideo", "-pix_fmt", "gray" if gray else "bgr24",
+               "-f", "rawvideo", "-pix_fmt", {1: "gray", 3: "bgr24", 4: "bgra"}[self.channels],
                "-s", f"{info.width}x{info.height}",
                "-r", info.fps_rational or str(info.fps), "-i", "-",
                *cargs]
@@ -237,7 +243,7 @@ class MatteWriter:
             cmd += ["-timecode", info.timecode]
         cmd.append(self.path)
         log.debug("ffmpeg: %s", " ".join(cmd))
-        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, **NO_WINDOW)
 
     def write(self, img: np.ndarray) -> None:
         if self.png_dir is not None:
@@ -274,6 +280,52 @@ def make_grid_points(width: int, height: int, n: int, margin: float = 0.05,
         ys = np.linspace(y0, y0 + rh, n)
     gx, gy = np.meshgrid(xs, ys)
     return np.stack([gx.ravel(), gy.ravel()], axis=-1).astype(np.float32)
+
+
+def seed_points(frame_bgr: np.ndarray, n: int, mask: Optional[np.ndarray] = None,
+                mode: str = "features", margin: float = 0.02) -> np.ndarray:
+    """Place ``n`` points de suivi sur une image.
+
+    mode="features" (recommandé) : coins de Shi-Tomasi, c.-à-d. les zones
+    texturées que TAPNext++ suit le mieux, répartis uniformément (distance
+    minimale entre points). Les zones unies (ciel, murs) sont évitées.
+    Complété par une grille si la zone manque de texture.
+    mode="grid" : grille régulière.
+    mask : image uint8 (255 = zone autorisée), à la taille de frame_bgr.
+    """
+    h, w = frame_bgr.shape[:2]
+    if mask is None:
+        mask = np.zeros((h, w), np.uint8)
+        mx, my = int(w * margin), int(h * margin)
+        mask[my:h - my, mx:w - mx] = 255
+    area = max(1.0, float((mask > 0).sum()))
+    n = max(1, int(n))
+    spacing = math.sqrt(area / n)
+    pts = np.zeros((0, 2), np.float32)
+    if mode == "features":
+        s = min(1.0, 1280.0 / max(w, h))
+        small = cv2.resize(frame_bgr, (max(1, int(w * s)), max(1, int(h * s))),
+                           interpolation=cv2.INTER_AREA) if s < 1 else frame_bgr
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        m_small = cv2.resize(mask, (gray.shape[1], gray.shape[0]),
+                             interpolation=cv2.INTER_NEAREST)
+        c = cv2.goodFeaturesToTrack(gray, maxCorners=n, qualityLevel=0.003,
+                                    minDistance=max(2.0, 0.7 * spacing * s),
+                                    mask=m_small, blockSize=7)
+        if c is not None:
+            pts = (c.reshape(-1, 2) / s).astype(np.float32)
+    if len(pts) < n:
+        # Grille dans la zone (complément ou mode grille).
+        k = max(1, int(round(math.sqrt((n - len(pts)) * w * h / area))))
+        grid = make_grid_points(w, h, k, 0.0)
+        gi = grid.astype(int)
+        inside = mask[np.clip(gi[:, 1], 0, h - 1), np.clip(gi[:, 0], 0, w - 1)] > 0
+        grid = grid[inside]
+        if len(pts) and len(grid):
+            d = np.linalg.norm(grid[:, None] - pts[None], axis=-1).min(1)
+            grid = grid[d > 0.5 * spacing]
+        pts = np.concatenate([pts, grid[: n - len(pts)]]) if len(grid) else pts
+    return pts.astype(np.float32)
 
 
 def parse_points(text: str) -> np.ndarray:
@@ -371,32 +423,50 @@ def ensure_checkpoint(path: Optional[str], input_res: int, download: bool = True
     return path
 
 
+class Cancelled(Exception):
+    """Levée quand l'utilisateur annule le traitement."""
+
+
+# progress(description, fraction 0..1)
+ProgressFn = Callable[[str, float], None]
+
+
 @dataclass
 class TrackResult:
     """Trajectoires sur toute la durée du clip (T = nb d'images du clip).
 
-    positions : [T, Q, 2] float32 (x, y) en pixels source, NaN hors plage suivie
-    visibility: [T, Q]    float32 probabilité de visibilité (0 hors plage)
-    tracked   : [T]       bool, image couverte par le tracking
+    positions   : [T, Q, 2] float32 (x, y) en pixels source, NaN hors plage
+    visibility  : [T, Q]    float32 probabilité de visibilité (0 hors plage)
+    tracked     : [T]       bool, image couverte par le tracking
+    query_frames: [Q]       int, image où chaque point a été posé
+    cut_frames  : [Q]       int, -1 ou image où le contrôle aller-retour a
+                            détecté un décrochage (piste coupée ensuite)
     """
     positions: np.ndarray
     visibility: np.ndarray
     tracked: np.ndarray
+    query_frames: Optional[np.ndarray] = None
+    cut_frames: Optional[np.ndarray] = None
 
 
 class TAPNextPPTracker:
-    """Inférence en ligne (image par image) de TAPNext++ avec état récurrent.
+    """Inférence en ligne de TAPNext++ avec état récurrent.
 
     * Les images sont redimensionnées en interne à input_res × input_res
       (INTER_AREA = anti-aliasing correct depuis la 4K) → VRAM maîtrisée.
+    * Chaque point peut être posé sur n'importe quelle image (requête
+      « tardive » native de TAPNext) ; le suivi arrière se fait en inversant
+      la séquence.
+    * Les images sont envoyées par paquets (``frames_per_step``) : résultat
+      identique au mode image par image, mais bien plus rapide sur GPU.
     * Les points sont traités par lots (``points_per_batch``), chaque lot
-      ayant son propre état récurrent : la VRAM ne dépend pas du nombre total
-      de points.
+      ayant son propre état récurrent.
     """
 
     def __init__(self, checkpoint: str, input_res: int = 512, device: str = "cuda",
                  fp16_weights: bool = False, points_per_batch: int = 512,
-                 use_certainty: bool = False, certainty_radius: float = 8.0):
+                 use_certainty: bool = False, certainty_radius: float = 8.0,
+                 frames_per_step: Optional[int] = None):
         import torch
 
         try:
@@ -418,6 +488,7 @@ class TAPNextPPTracker:
             torch.backends.cudnn.allow_tf32 = True
         self.input_res = int(input_res)
         self.points_per_batch = max(1, int(points_per_batch))
+        self.frames_per_step = max(1, int(frames_per_step or (8 if self.is_cuda else 1)))
         self.use_certainty = use_certainty
         self.certainty_radius = certainty_radius
 
@@ -435,15 +506,15 @@ class TAPNextPPTracker:
 
     # ------------------------------------------------------------------ utils
     def preprocess(self, frame_bgr: np.ndarray) -> np.ndarray:
-        """BGR (H, W) → RGB uint8 (S, S). Gardé compact pour un éventuel cache."""
+        """BGR (H, W) → RGB uint8 (S, S). Gardé compact pour le cache."""
         small = cv2.resize(frame_bgr, (self.input_res, self.input_res),
                            interpolation=cv2.INTER_AREA)
         return cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
 
-    def _to_tensor(self, rgb_small: np.ndarray):
-        t = self.torch.from_numpy(rgb_small).to(self.device, non_blocking=True)
-        t = t.float().div_(127.5).sub_(1.0)          # [-1, 1]
-        return t[None, None]                           # [1, 1, S, S, 3]
+    def _to_tensor(self, rgb_small: Sequence[np.ndarray]):
+        arr = np.ascontiguousarray(np.stack(rgb_small))            # [T, S, S, 3]
+        t = self.torch.from_numpy(arr).to(self.device, non_blocking=True)
+        return t.float().div_(127.5).sub_(1.0)[None]               # [1, T, S, S, 3]
 
     def _autocast(self):
         if self.is_cuda:
@@ -451,35 +522,38 @@ class TAPNextPPTracker:
         return self.torch.amp.autocast("cpu", enabled=False)
 
     # --------------------------------------------------------------- tracking
-    def track(self, frames: Iterable[np.ndarray], queries_xy: np.ndarray,
-              width: int, height: int, n_frames_hint: int = 0,
+    def track(self, frames: Sequence[np.ndarray], queries_xy: np.ndarray,
+              query_t: np.ndarray, width: int, height: int,
+              progress: Optional[ProgressFn] = None, cancel=None,
               desc: str = "Tracking") -> Tuple[np.ndarray, np.ndarray]:
-        """Suit ``queries_xy`` (pixels source, définis sur la 1re image fournie).
+        """Suit ``queries_xy`` (pixels source) posés aux indices ``query_t``
+        de la séquence ``frames`` (images prétraitées, cf. preprocess).
 
-        Args:
-            frames: itérable d'images déjà prétraitées (sortie de preprocess).
-        Returns:
-            positions [T, Q, 2] (pixels source) et visibility [T, Q] (probas).
+        Returns: positions [T, Q, 2] (pixels source) et visibility [T, Q].
+        Avant son image de requête, un point n'a pas de prédiction valable.
         """
         torch = self.torch
         sx, sy = MODEL_COORD_SIZE / width, MODEL_COORD_SIZE / height
         q = queries_xy.shape[0]
-        # Requêtes TAPNext : [t, y, x] dans l'espace modèle 256×256.
-        qt = np.zeros((q, 3), np.float32)
+        T = len(frames)
+        qt = np.zeros((q, 3), np.float32)                # [t, y, x] espace modèle
+        qt[:, 0] = np.clip(query_t, 0, max(T - 1, 0))
         qt[:, 1] = queries_xy[:, 1] * sy
         qt[:, 2] = queries_xy[:, 0] * sx
         batches = [slice(i, min(i + self.points_per_batch, q))
                    for i in range(0, q, self.points_per_batch)]
         states: List[Optional[object]] = [None] * len(batches)
-        pos_out: List[np.ndarray] = []
-        vis_out: List[np.ndarray] = []
+        pos = np.full((T, q, 2), np.nan, np.float32)
+        vis = np.zeros((T, q), np.float32)
+        step = self.frames_per_step
+        bar = _progress(T, desc) if progress is None else None
 
-        bar = _progress(n_frames_hint, desc)
         with torch.inference_mode(), self._autocast():
-            for rgb in frames:
-                video = self._to_tensor(rgb)
-                pos_f = np.empty((q, 2), np.float32)
-                vis_f = np.empty((q,), np.float32)
+            for t0 in range(0, T, step):
+                if cancel is not None and cancel.is_set():
+                    raise Cancelled()
+                t1 = min(T, t0 + step)
+                video = self._to_tensor(frames[t0:t1])
                 for bi, sl in enumerate(batches):
                     if states[bi] is None:
                         query = torch.from_numpy(qt[sl]).to(self.device)[None]
@@ -488,68 +562,173 @@ class TAPNextPPTracker:
                     else:
                         tracks, track_logits, vis_logits, states[bi] = self.model(
                             video=video, state=states[bi])
-                    # tracks : [1, 1, Qb, 2] en (y, x) ; vis_logits : [1, 1, Qb, 1]
-                    vis = torch.sigmoid(vis_logits[0, 0, :, 0].float())
+                    # tracks : [1, t, Qb, 2] en (y, x) ; vis_logits : [1, t, Qb, 1]
+                    v = torch.sigmoid(vis_logits[0, :, :, 0].float())
                     if self.use_certainty:
                         cert = self._certainty(tracks.float(), track_logits.float(),
                                                self.certainty_radius)
-                        vis = vis * cert[0, 0, :, 0]
-                    yx = tracks[0, 0].float().cpu().numpy()
-                    pos_f[sl, 0] = yx[:, 1] / sx
-                    pos_f[sl, 1] = yx[:, 0] / sy
-                    vis_f[sl] = vis.cpu().numpy()
-                pos_out.append(pos_f)
-                vis_out.append(vis_f)
-                bar.update()
-        bar.close()
+                        v = v * cert[0, :, :, 0]
+                    yx = tracks[0].float().cpu().numpy()
+                    pos[t0:t1, sl, 0] = yx[..., 1] / sx
+                    pos[t0:t1, sl, 1] = yx[..., 0] / sy
+                    vis[t0:t1, sl] = v.cpu().numpy()
+                if bar is not None:
+                    bar.update(t1 - t0)
+                else:
+                    progress(desc, t1 / T)
+        if bar is not None:
+            bar.close()
+        # Avant l'image de requête, la sortie n'a pas de sens.
+        before = np.arange(T)[:, None] < qt[None, :, 0].astype(int)
+        pos[before] = np.nan
+        vis[before] = 0.0
         if self.is_cuda:
-            log.info("VRAM max utilisée : %.2f Go",
-                     torch.cuda.max_memory_allocated() / 1024 ** 3)
-        if not pos_out:
-            return np.zeros((0, q, 2), np.float32), np.zeros((0, q), np.float32)
-        return np.stack(pos_out), np.stack(vis_out)
+            log.debug("VRAM max utilisée : %.2f Go",
+                      torch.cuda.max_memory_allocated() / 1024 ** 3)
+        return pos, vis
 
 
-def run_tracking(tracker: TAPNextPPTracker, info: VideoInfo, queries_xy: np.ndarray,
-                 start: int, end: int, backward: bool) -> TrackResult:
-    """Suivi avant (start → end) et, optionnellement, arrière (start → 0)."""
-    cache: List[np.ndarray] = []
+def load_frames(tracker: TAPNextPPTracker, path: str, start: int, end: int,
+                progress: Optional[ProgressFn] = None, cancel=None,
+                n_hint: int = 0) -> List[np.ndarray]:
+    """Lit [start, end] et garde les images réduites à input_res (~0,8 Mo/image
+    en 512) : nécessaire au suivi arrière et au contrôle aller-retour."""
+    frames: List[np.ndarray] = []
+    bar = _progress(n_hint, "Lecture vidéo") if progress is None else None
+    for _, frame in iter_frames(path, start, end):
+        if cancel is not None and cancel.is_set():
+            raise Cancelled()
+        frames.append(tracker.preprocess(frame))
+        if bar is not None:
+            bar.update()
+        elif n_hint:
+            progress("Lecture vidéo", min(1.0, len(frames) / n_hint))
+    if bar is not None:
+        bar.close()
+    return frames
 
-    def forward_frames() -> Iterator[np.ndarray]:
-        # On lit depuis 0 si le suivi arrière est demandé, pour mettre en cache
-        # les images (déjà réduites à input_res, ~0,8 Mo/image en 512).
-        for idx, frame in iter_frames(info.path, 0 if backward else start, end):
-            small = tracker.preprocess(frame)
-            if idx < start:
-                cache.append(small)
-                continue
-            if backward and idx == start:
-                cache.append(small)
-            yield small
 
-    n_hint = (end if end >= 0 else info.frame_count - 1) - start + 1
-    pos_f, vis_f = tracker.track(forward_frames(), queries_xy, info.width, info.height,
-                                 n_hint, "Tracking avant")
-    n_total = max(info.frame_count, start + len(pos_f))
-    q = queries_xy.shape[0]
+def track_segment(tracker: TAPNextPPTracker, frames: Sequence[np.ndarray], seg_start: int,
+                  queries_xy: np.ndarray, query_frames: np.ndarray,
+                  width: int, height: int, n_total: int, verify: bool = False,
+                  progress: Optional[ProgressFn] = None, cancel=None) -> TrackResult:
+    """Suivi bidirectionnel de points posés sur des images quelconques.
+
+    * Passe avant  : chaque point est suivi de son image de requête à la fin.
+    * Passe arrière: s'il en est besoin, de son image de requête au début.
+    * verify=True  : contrôle aller-retour. Chaque piste est re-suivie en sens
+      inverse depuis sa dernière position fiable ; si le retour ne revient pas
+      sur le point d'origine, la piste a décroché. Le décrochage est localisé
+      (dernière image où les deux sens divergent) et la piste est coupée à
+      partir de là → plus de masques qui « glissent » sur le décor.
+    """
+    T = len(frames)
+    q = len(queries_xy)
+    qt = np.clip(np.asarray(query_frames, int) - seg_start, 0, max(T - 1, 0))
+    need_bwd = bool((qt > 0).any())
+    passes = 1 + int(need_bwd) + (1 + int(need_bwd)) * int(verify)
+    done = [0]
+
+    def sub(desc):
+        if progress is None:
+            return None
+        k = done[0]
+        return lambda _d, f: progress(desc, (k + f) / passes)
+
+    rev = list(reversed(frames))
+    pf, vf = tracker.track(frames, queries_xy, qt, width, height, sub("Tracking avant"),
+                           cancel, "Tracking avant")
+    done[0] += 1
+    pos, vis = pf, vf
+    if need_bwd:
+        pb, vb = tracker.track(rev, queries_xy, T - 1 - qt, width, height,
+                               sub("Tracking arrière"), cancel, "Tracking arrière")
+        done[0] += 1
+        pb, vb = pb[::-1], vb[::-1]
+        before = np.arange(T)[:, None] < qt[None, :]
+        pos = np.where(before[..., None], pb, pf)
+        vis = np.where(before, vb, vf)
+
+    cut = np.full(q, -1, int)
+    if verify and T > 1:
+        thr = max(3.0, 0.004 * max(width, height))
+        tt = np.arange(T)
+        vis_ok = vis >= 0.5
+        # --- vérification de la partie avant : retour depuis la dernière image visible
+        last = np.array([qt[i] + (np.nonzero(vis_ok[qt[i]:, i])[0].max()
+                                  if vis_ok[qt[i]:, i].any() else 0) for i in range(q)])
+        sel = np.nonzero(last > qt)[0]
+        if sel.size:
+            p_q = pos[last[sel], sel]
+            pv, vv = tracker.track(rev, p_q, T - 1 - last[sel], width, height,
+                                   sub("Contrôle aller-retour"), cancel, "Contrôle aller-retour")
+            pv, vv = pv[::-1], vv[::-1]
+            for j, i in enumerate(sel):
+                err = np.linalg.norm(pos[:, i] - pv[:, j], axis=-1)
+                span = (tt >= qt[i]) & (tt <= last[i]) & vis_ok[:, i] & (vv[:, j] >= 0.5)
+                if not np.isfinite(err[qt[i]]) or err[qt[i]] <= thr:
+                    continue
+                bad = np.nonzero(span & (err > thr))[0]
+                k = (bad.max() + 1) if bad.size else qt[i] + 1
+                vis[k:, i] = 0.0
+                cut[i] = k
+        done[0] += 1
+        # --- vérification de la partie arrière : aller depuis la 1re image visible
+        if need_bwd:
+            first = np.array([np.nonzero(vis_ok[:qt[i] + 1, i])[0].min()
+                              if vis_ok[:qt[i] + 1, i].any() else qt[i] for i in range(q)])
+            sel = np.nonzero(first < qt)[0]
+            if sel.size:
+                pv, vv = tracker.track(frames, pos[first[sel], sel], first[sel], width, height,
+                                       sub("Contrôle aller-retour"), cancel,
+                                       "Contrôle aller-retour")
+                for j, i in enumerate(sel):
+                    err = np.linalg.norm(pos[:, i] - pv[:, j], axis=-1)
+                    span = (tt >= first[i]) & (tt <= qt[i]) & vis_ok[:, i] & (vv[:, j] >= 0.5)
+                    if not np.isfinite(err[qt[i]]) or err[qt[i]] <= thr:
+                        continue
+                    bad = np.nonzero(span & (err > thr))[0]
+                    k = (bad.min() - 1) if bad.size else qt[i] - 1
+                    vis[:k + 1, i] = 0.0
+                    cut[i] = k
+            done[0] += 1
+        n_cut = int((cut >= 0).sum())
+        log.info("Contrôle aller-retour : %d piste(s) sur %d coupée(s) au décrochage.",
+                 n_cut, q)
+
     positions = np.full((n_total, q, 2), np.nan, np.float32)
     visibility = np.zeros((n_total, q), np.float32)
     tracked = np.zeros(n_total, bool)
-    positions[start:start + len(pos_f)] = pos_f
-    visibility[start:start + len(vis_f)] = vis_f
-    tracked[start:start + len(pos_f)] = True
+    positions[seg_start:seg_start + T] = pos
+    visibility[seg_start:seg_start + T] = vis
+    tracked[seg_start:seg_start + T] = True
+    cut_abs = np.where(cut >= 0, cut + seg_start, -1)
+    return TrackResult(positions, visibility, tracked, qt + seg_start, cut_abs)
 
-    if backward and start > 0 and cache:
-        pos_b, vis_b = tracker.track(reversed(cache), queries_xy, info.width, info.height,
-                                     len(cache), "Tracking arrière")
-        # pos_b[0] = image start ; pos_b[k] = image start - k
-        positions[:start] = pos_b[1:][::-1]
-        visibility[:start] = vis_b[1:][::-1]
-        tracked[:start] = True
-    # On tronque si OpenCV a surestimé le nombre d'images.
-    last = int(np.nonzero(tracked)[0].max()) + 1 if tracked.any() else 0
-    n_real = max(last, min(n_total, info.frame_count))
-    return TrackResult(positions[:n_real], visibility[:n_real], tracked[:n_real])
+
+def run_tracking(tracker: TAPNextPPTracker, info: VideoInfo, queries_xy: np.ndarray,
+                 start: int, end: int, backward: bool, verify: bool = False,
+                 query_frames: Optional[np.ndarray] = None) -> TrackResult:
+    """Version « fichier » utilisée par la ligne de commande."""
+    seg_start = 0 if backward else start
+    last = end if end >= 0 else info.frame_count - 1
+    frames = load_frames(tracker, info.path, seg_start, end,
+                         n_hint=max(0, last - seg_start + 1))
+    if not frames:
+        raise RuntimeError("Aucune image lue dans la plage demandée.")
+    n_total = max(info.frame_count, seg_start + len(frames))
+    if query_frames is None:
+        query_frames = np.full(len(queries_xy), start, int)
+    res = track_segment(tracker, frames, seg_start, queries_xy, query_frames,
+                        info.width, info.height, n_total, verify)
+    # On tronque si OpenCV a surestimé le nombre d'images du fichier.
+    n_real = max(seg_start + len(frames), min(n_total, info.frame_count))
+    if len(frames) < last - seg_start + 1:
+        n_real = seg_start + len(frames)
+    res.positions = res.positions[:n_real]
+    res.visibility = res.visibility[:n_real]
+    res.tracked = res.tracked[:n_real]
+    return res
 
 
 # =============================================================================
@@ -829,47 +1008,77 @@ def _progress(total: int, desc: str):
         return _Bar()
 
 
-def render_outputs(args, info: VideoInfo, res: TrackResult, smoothed: np.ndarray,
-                   alpha: np.ndarray, velocity: np.ndarray, direction: np.ndarray,
-                   out_base: str) -> List[str]:
-    params = MatteParams(
+@dataclass
+class RenderData:
+    """Données prêtes pour le rendu des mattes (calculées une fois)."""
+    smoothed: np.ndarray    # [T, Q, 2] trajectoires lissées (pixels source)
+    velocity: np.ndarray    # [T, Q]    vitesse px/image
+    direction: np.ndarray   # [T, Q, 2] (dx, dy)
+    alpha: np.ndarray       # [T, Q]    opacité avec fondus
+    draw_pos: np.ndarray    # [T, Q, 2] positions de dessin (maintien en occultation)
+    speed: np.ndarray       # [T, Q]    vitesse utilisée par le rendu (0 si occulté)
+    visible: np.ndarray     # [T, Q]    bool
+
+
+def prepare_render_data(res: TrackResult, smooth_sigma: float, vis_threshold: float,
+                        fade_in: int, fade_out: int) -> RenderData:
+    smoothed = smooth_tracks(res.positions, res.visibility, smooth_sigma)
+    velocity, direction = compute_velocity(smoothed)
+    alpha = visibility_envelope(res.visibility, res.tracked, vis_threshold, fade_in, fade_out)
+    visible = res.visibility >= vis_threshold
+    draw_pos = hold_occluded_positions(smoothed, visible)
+    # Pendant un maintien (occultation) le blob ne doit pas s'étirer.
+    speed = np.where(visible, velocity, 0.0).astype(np.float32)
+    return RenderData(smoothed, velocity, direction, alpha, draw_pos, speed, visible)
+
+
+def write_matte_video(out_base: str, info: VideoInfo, codec: str, params: MatteParams,
+                      rd: RenderData, preview: bool = False,
+                      progress: Optional[ProgressFn] = None, cancel=None) -> List[str]:
+    """Rend la matte (et option : la vidéo de contrôle) à la résolution source."""
+    renderer = MatteRenderer(info.width, info.height, params)
+    writer = MatteWriter(out_base, info, codec)
+    outputs = [writer.path]
+    pv_writer = None
+    src_iter = None
+    if preview:
+        pv_writer = MatteWriter(out_base, info, "h264", suffix="_preview", gray=False)
+        outputs.append(pv_writer.path)
+        src_iter = iter_frames(info.path)
+    T = len(rd.alpha)
+    bar = _progress(T, "Rendu matte") if progress is None else None
+    colors = _point_colors(rd.alpha.shape[1])
+    try:
+        for t in range(T):
+            if cancel is not None and cancel.is_set():
+                raise Cancelled()
+            m = renderer.render(rd.draw_pos[t], rd.alpha[t], rd.speed[t], rd.direction[t])
+            writer.write(m)
+            if pv_writer is not None:
+                nxt = next(src_iter, None)
+                frame = nxt[1] if nxt else np.zeros((info.height, info.width, 3), np.uint8)
+                pv_writer.write(_preview_frame(frame, m, rd.smoothed[t], rd.visible[t], colors))
+            if bar is not None:
+                bar.update()
+            elif t % 4 == 0 or t == T - 1:
+                progress("Rendu de la matte", (t + 1) / T)
+    finally:
+        if bar is not None:
+            bar.close()
+        writer.close()
+        if pv_writer is not None:
+            pv_writer.close()
+    return outputs
+
+
+def matte_params_from_args(args) -> MatteParams:
+    return MatteParams(
         radius=args.radius, merge=args.merge, threshold=args.threshold,
         edge_softness=args.edge_softness, motion_mode=args.motion_mode,
         motion_sensitivity=args.motion_sensitivity,
         max_motion_scale=args.max_motion_scale,
         render_max_side=args.render_max_side, invert=args.invert,
     )
-    renderer = MatteRenderer(info.width, info.height, params)
-    visible = res.visibility >= args.vis_threshold
-    draw_pos = hold_occluded_positions(smoothed, visible)
-    # Pendant un maintien (occultation) le blob ne doit pas s'étirer.
-    speed = np.where(visible, velocity, 0.0)
-    writer = MatteWriter(out_base, info, args.codec)
-    outputs = [writer.path]
-    preview = None
-    src_iter = None
-    if args.preview:
-        preview = MatteWriter(out_base, info, "h264", suffix="_preview", gray=False)
-        outputs.append(preview.path)
-        src_iter = iter_frames(info.path)
-    T = len(alpha)
-    bar = _progress(T, "Rendu matte")
-    colors = _point_colors(alpha.shape[1])
-    try:
-        for t in range(T):
-            m = renderer.render(draw_pos[t], alpha[t], speed[t], direction[t])
-            writer.write(m)
-            if preview is not None:
-                nxt = next(src_iter, None)
-                frame = nxt[1] if nxt else np.zeros((info.height, info.width, 3), np.uint8)
-                preview.write(_preview_frame(frame, m, smoothed[t], visible[t], colors))
-            bar.update()
-    finally:
-        bar.close()
-        writer.close()
-        if preview is not None:
-            preview.close()
-    return outputs
 
 
 def _point_colors(n: int) -> np.ndarray:
@@ -916,12 +1125,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     g.add_argument("--fp16-weights", action="store_true", default=d["fp16_weights"],
                    help="Charger les poids en float16 (économise de la VRAM)")
     g.add_argument("--points-per-batch", type=int, default=d["points_per_batch"])
+    g.add_argument("--frames-per-step", type=int, default=None,
+                   help="Images envoyées ensemble au modèle (défaut : 8 sur GPU)")
+    g.add_argument("--no-refine", action="store_true",
+                   help="Désactive l'affinage sous-pixel (suivi hybride TAPNext++ + flux optique)")
+    g.add_argument("--verify", action="store_true",
+                   help="Contrôle aller-retour : coupe les pistes qui décrochent (×2 temps)")
     g.add_argument("--use-certainty", action="store_true", default=d["use_certainty"],
                    help="Visibilité × certitude de position (moins de faux positifs)")
     g.add_argument("--no-download", action="store_true",
                    help="Ne pas télécharger le checkpoint automatiquement")
 
     g = ap.add_argument_group("Points de tracking")
+    g.add_argument("--seed", choices=["features", "grid"], default="features",
+                   help="Placement automatique : 'features' = zones texturées (recommandé)")
+    g.add_argument("--num-points", type=int, default=None,
+                   help="Nombre de points automatiques (défaut : grid²)")
     g.add_argument("--grid", type=int, default=d["grid"], help="Grille N×N automatique")
     g.add_argument("--grid-margin", type=float, default=d["grid_margin"])
     g.add_argument("--roi", type=float, nargs=4, metavar=("X", "Y", "W", "H"),
@@ -1001,7 +1220,16 @@ def resolve_queries(args, info: VideoInfo) -> np.ndarray:
         if roi is not None and args.normalized:
             roi = [roi[0] * info.width, roi[1] * info.height,
                    roi[2] * info.width, roi[3] * info.height]
-        pts = make_grid_points(info.width, info.height, args.grid, args.grid_margin, roi)
+        frame = next(iter_frames(info.path, args.start_frame, args.start_frame), None)
+        if frame is None:
+            raise SystemExit("start-frame hors de la vidéo.")
+        mask = None
+        if roi is not None:
+            mask = np.zeros((info.height, info.width), np.uint8)
+            x, y, rw, rh = (int(round(v)) for v in roi)
+            mask[max(0, y):y + rh, max(0, x):x + rw] = 255
+        n = args.num_points or args.grid * args.grid
+        pts = seed_points(frame[1], n, mask, args.seed, args.grid_margin)
     pts[:, 0] = np.clip(pts[:, 0], 0, info.width - 1)
     pts[:, 1] = np.clip(pts[:, 1], 0, info.height - 1)
     return pts
@@ -1027,19 +1255,25 @@ def main(argv: Optional[List[str]] = None) -> int:
     # --- 1. Tracking ---------------------------------------------------------
     ckpt = ensure_checkpoint(args.checkpoint, args.input_res, not args.no_download)
     tracker = TAPNextPPTracker(ckpt, args.input_res, args.device, args.fp16_weights,
-                               args.points_per_batch, args.use_certainty)
+                               args.points_per_batch, args.use_certainty,
+                               frames_per_step=args.frames_per_step)
     res = run_tracking(tracker, info, queries, args.start_frame, args.end_frame,
-                       args.backward)
+                       args.backward, args.verify)
     del tracker
     _free_gpu()
+    if not args.no_refine:
+        import track_refine
+        last = args.end_frame if args.end_frame >= 0 else len(res.tracked) - 1
+        st = track_refine.refine_tracks(info.path, res, 0 if args.backward else args.start_frame,
+                                        last, info.width, info.height, query_xy=queries)
+        log.info("Affinage sous-pixel : %d mesures, %d recalages.", st["lk"], st["resets"])
     log.info("Tracking terminé : %d images suivies sur %d", int(res.tracked.sum()),
              len(res.tracked))
 
     # --- 2. Post-traitement --------------------------------------------------
-    smoothed = smooth_tracks(res.positions, res.visibility, args.smooth_sigma)
-    velocity, direction = compute_velocity(smoothed)
-    alpha = visibility_envelope(res.visibility, res.tracked, args.vis_threshold,
-                                args.fade_in, args.fade_out)
+    rd = prepare_render_data(res, args.smooth_sigma, args.vis_threshold,
+                             args.fade_in, args.fade_out)
+    smoothed, velocity = rd.smoothed, rd.velocity
 
     # --- 3. Exports données --------------------------------------------------
     csv_path = out_base + "_tracks.csv"
@@ -1071,8 +1305,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # --- 4. Matte -------------------------------------------------------------
     if not args.no_matte:
-        outputs += render_outputs(args, info, res, smoothed, alpha, velocity,
-                                  direction, out_base)
+        outputs += write_matte_video(out_base, info, args.codec,
+                                     matte_params_from_args(args), rd, args.preview)
 
     log.info("Terminé en %.1f s. Fichiers générés :", time.time() - t0)
     for p in outputs:

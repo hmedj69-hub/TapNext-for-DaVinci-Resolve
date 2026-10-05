@@ -620,3 +620,46 @@ if __name__ == "__main__":
         _run_inside_fusion(_fu, _comp)
     else:
         _cli()
+
+
+# ---------------------------------------------------------------------------
+# Description des nœuds en données Lua (secours du script Resolve)
+# ---------------------------------------------------------------------------
+# Si comp:Paste() échoue (comp non affichée dans la page Fusion…), le script
+# Resolve reconstruit les nœuds avec comp:AddTool() à partir de ce fichier.
+
+def tools_path(setting_path: str) -> str:
+    base = setting_path[:-8] if setting_path.endswith(".setting") else setting_path
+    return base + "_tools.lua"
+
+
+def _lua_val(v) -> str:
+    if isinstance(v, str):
+        return '"%s"' % v.replace("\\", "\\\\").replace('"', '\\"')
+    if isinstance(v, (tuple, list)):
+        return "{ " + ", ".join(_lua_val(x) for x in v) + " }"
+    return _fmt(float(v))
+
+
+def write_tools_lua(setting_path: str, specs: List[dict]) -> str:
+    """specs : [{name, type, static: {input: valeur}, numbers: {input: {image: v}},
+    points: {input: {image: (x, y)}}}] → fichier « return { … } »."""
+    out = ["return {"]
+    for s in specs:
+        out.append("  { name = %s, type = %s," % (_lua_val(s["name"]), _lua_val(s["type"])))
+        for kind in ("static", "numbers", "points"):
+            d = s.get(kind) or {}
+            out.append("    %s = {" % kind)
+            for inp, val in d.items():
+                if kind == "static":
+                    out.append("      [%s] = %s," % (_lua_val(inp), _lua_val(val)))
+                else:
+                    keys = ", ".join("[%d] = %s" % (f, _lua_val(val[f])) for f in sorted(val))
+                    out.append("      [%s] = { %s }," % (_lua_val(inp), keys))
+            out.append("    },")
+        out.append("  },")
+    out.append("}")
+    p = tools_path(setting_path)
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("\n".join(out) + "\n")
+    return p

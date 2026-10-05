@@ -7,4 +7,7 @@ checkpoints/
 *_matte_png/
 *_preview.mp4
 tools/
-tap_gui_settings.json
+jobs/
+output/
+logs/
+studio_settings.json

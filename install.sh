@@ -7,7 +7,7 @@ ROOT="$PWD"; TOOLS="$ROOT/tools"; VENV="$ROOT/.venv"; PY="$VENV/bin/python"
 export UV_PYTHON_INSTALL_DIR="$TOOLS/python" UV_LINK_MODE=copy UV_HTTP_TIMEOUT=300
 mkdir -p "$TOOLS"
 
-echo "[1/7] Gestionnaire de paquets uv…"
+echo "[1/9] Gestionnaire de paquets uv…"
 if command -v uv >/dev/null 2>&1; then UV="$(command -v uv)"
 else
   UV="$TOOLS/uv"
@@ -24,11 +24,10 @@ else
   fi
 fi
 
-echo "[2/7] Python 3.11 (local)…"
-if [ -x "$PY" ] && ! "$PY" -c "import tkinter" 2>/dev/null; then rm -rf "$VENV"; fi
+echo "[2/9] Python 3.11 (local)…"
 [ -x "$PY" ] || "$UV" venv "$VENV" --python 3.11 --python-preference only-managed --seed
 
-echo "[3/7] PyTorch…"
+echo "[3/9] PyTorch…"
 if command -v nvidia-smi >/dev/null 2>&1; then
   echo "      GPU NVIDIA détecté → CUDA 12.4"
   "$UV" pip install --python "$PY" torch torchvision --index-url https://download.pytorch.org/whl/cu124
@@ -39,19 +38,29 @@ else
   "$UV" pip install --python "$PY" torch torchvision --index-url https://download.pytorch.org/whl/cpu
 fi
 
-echo "[4/7] OpenCV, ffmpeg et dépendances…"
-"$UV" pip install --python "$PY" opencv-python numpy einops tqdm imageio-ffmpeg
+echo "[4/9] OpenCV, ffmpeg, interface Qt et dépendances…"
+"$UV" pip install --python "$PY" opencv-python numpy einops tqdm imageio-ffmpeg PySide6-Essentials scipy
 
-echo "[5/7] TAPNext++ (google-deepmind/tapnet)…"
+echo "[5/9] TAPNext++ (google-deepmind/tapnet)…"
 "$UV" pip install --python "$PY" --no-deps --reinstall-package tapnet \
     "tapnet @ https://github.com/google-deepmind/tapnet/archive/refs/heads/main.zip" \
   || "$UV" pip install --python "$PY" --no-deps "tapnet @ git+https://github.com/google-deepmind/tapnet.git"
 
-echo "[6/7] Modèle TAPNext++ 512 px (~2,5 Go, une seule fois)…"
+echo "[6/9] Modèle TAPNext++ 512 px (~2,5 Go, une seule fois)…"
 "$PY" -c "import tap_resolve_tool as t; print('      ', t.ensure_checkpoint(None, 512))"
 
-echo "[7/7] Vérification…"
-"$PY" -c "import tkinter, torch, cv2, imageio_ffmpeg; from tapnet.tapnextpp.votsp2026.model import TAPNextPP; c=torch.cuda.is_available(); print('       PyTorch', torch.__version__, '| CUDA :', c, '|', torch.cuda.get_device_name(0) if c else 'CPU'); print('       OpenCV', cv2.__version__, '| ffmpeg OK | Tk OK | TAPNext++ OK')"
-chmod +x TAPNext_Resolve.sh 2>/dev/null || true
+echo "[7/9] Vérification…"
+"$PY" -c "import PySide6, torch, cv2, imageio_ffmpeg, scipy; from tapnet.tapnextpp.votsp2026.model import TAPNextPP; c=torch.cuda.is_available(); print('       PyTorch', torch.__version__, '| CUDA :', c, '|', torch.cuda.get_device_name(0) if c else 'CPU'); print('       OpenCV', cv2.__version__, '| ffmpeg OK | Qt OK | TAPNext++ OK')"
+echo "[8/9] Intégration dans DaVinci Resolve (Workspace > Scripts)…"
+"$PY" resolve_plugin/install_resolve_plugin.py || echo "      ATTENTION : intégration Resolve impossible, voir README."
+echo "[9/9] Effet OFX « TAPNext Shapes »…"
+if [ "$(uname -s)" = "Linux" ]; then
+  if sudo -n true 2>/dev/null || [ "$(id -u)" = 0 ]; then sudo ./ofx_plugin/install_ofx.sh || true
+  else echo "      Pour l'installer : sudo ./ofx_plugin/install_ofx.sh"; fi
+else
+  echo "      macOS : compilez-le avec ofx_plugin/CMakeLists.txt (voir README)."
+fi
+chmod +x TAPNext_Studio.sh 2>/dev/null || true
 echo
-echo "Installation terminée. Lancez l'interface : ./TAPNext_Resolve.sh"
+echo "Installation terminée. Application : ./TAPNext_Studio.sh"
+echo "Dans DaVinci Resolve : Workspace > Scripts > TAPNext_Tracker"

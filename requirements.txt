@@ -7,5 +7,7 @@ numpy
 einops
 tqdm
 imageio-ffmpeg
+PySide6-Essentials
+scipy            # stabilisation (trajectoire cinéma)
 # TAPNext++ (non publié sur PyPI). Installez-le sans dépendances pour éviter JAX/TensorFlow :
 #   pip install --no-deps "tapnet @ git+https://github.com/google-deepmind/tapnet.git"

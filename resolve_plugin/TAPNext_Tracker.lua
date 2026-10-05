@@ -548,6 +548,17 @@ function M.import_results(resolve, root, job_text, done_text)
       "nœuds (ou clic droit → Add Matte), puis reliez sa sortie bleue (Key) à l'entrée Key " ..
       "du nœud à corriger."
   end
+  local stab = M.json_field(done_text, "stabilized_video")
+  if stab and stab ~= "" then
+    local oks, why = M.import_to_bin(resolve, stab)
+    if oks then
+      report[#report + 1] = "✔ Vidéo stabilisée dans le chutier « TAPNext » (même durée et timecode " ..
+        "que l'original). Page Edit : glissez-la sur le clip d'origine dans le viewer → Replace : " ..
+        "elle se cale image pour image."
+    else
+      report[#report + 1] = "✘ Import de la vidéo stabilisée impossible (" .. tostring(why) .. ") : " .. stab
+    end
+  end
   local depth = M.json_field(done_text, "depth_video")
   if depth and depth ~= "" then
     local okd, why = M.import_to_bin(resolve, depth)

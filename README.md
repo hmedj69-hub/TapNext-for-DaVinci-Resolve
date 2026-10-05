@@ -56,38 +56,43 @@ INSTALLER_Windows.bat, install.sh, TAPNext_Studio.bat/.sh, TAPNext_CLI.bat
 
 ## 🎯 Stabilisation et tracking (onglet ③ de Studio)
 
-### Comment ça marche
+### Stabiliser un plan (mode Automatique, recommandé)
+Pas besoin de lancer le suivi : ouvrez la vidéo, puis l'onglet **③ Stabiliser**. L'analyse démarre toute seule (environ 20 ms par image).
+
+Le principe est celui des stabilisateurs de référence (Resolve, Warp Stabilizer, vid.stab) :
+1. **Analyse sur toute l'image** : environ 600 points répartis sur une grille, suivis d'image en image avec un contrôle aller-retour. Le mouvement est estimé par RANSAC, ce qui rejette ce qui bouge autrement (personnages, reflets). Les **zones des sujets suivis** dans l'onglet ① sont en plus ignorées.
+2. **Trajectoire de la caméra** reconstruite, puis **lissée** : les tremblements partent, le mouvement voulu (panoramique, travelling) reste.
+3. **Recadrage limité** : là où la correction demanderait trop de zoom, elle est adoucie localement, au lieu de zoomer tout le plan. Elle n'est jamais annulée : les vibrations restent retirées.
+4. **Vidéo stabilisée** rendue en pleine résolution à l'export. Elle garde la même durée et le même timecode que la source, et elle est importée dans le chutier TAPNext.
+
+Réglages :
+- **Lisser** (par défaut) ou **Verrouiller** (pied virtuel, caméra immobile). Si le plan bouge trop pour être verrouillé, la correction se transforme progressivement en lissage là où c'est nécessaire.
+- **Force du lissage** : environ la durée, en images, des mouvements considérés comme des tremblements. 30 (≈ 1 s) donne une caméra à l'épaule très douce, 80 et plus un effet steadicam.
+- **Recadrage maximal** : 10 % par défaut (zoom ×1,11 au plus).
+- **Position / Rotation / Échelle**, **zoom automatique**, **aperçu stabilisé** (la vue montre directement le résultat).
+- La ligne **Tremblement : avant → après** mesure le résultat en pixels par image.
+
+Mesuré sur un plan à l'épaule de test (panoramique + tremblements, sujet de 25 % de l'image qui traverse le champ) : **4,9 px → 0,03 px par image**, avec un zoom de ×1,07. La mesure est faite sur la vidéo rendue.
+
+### Suivre un sujet, une surface ou verrouiller sans dérive (points TAPNext)
+Choisissez dans **Mouvement de** un groupe de points suivis par TAPNext++ (onglet ①).
+
 | Étape | Technique | Pourquoi |
 |---|---|---|
-| Suivi long terme | **TAPNext++** | Suit les points sur des centaines d'images, gère les occultations et **retrouve** les points qui réapparaissent. Aucun décrochage définitif. |
-| Précision | **Affinage hybride** : flux optique Lucas-Kanade local sur l'image haute résolution, fusionné avec TAPNext++ par un filtre complémentaire | TAPNext++ prédit dans une grille de 256 px (±4 px en 1080p). Le flux optique apporte le sous-pixel, et TAPNext++ empêche toute dérive. |
-| Mouvement | **Solveur RANSAC** : translation, position + rotation + échelle, ou **perspective** (surface plane) | Les points qui bougent autrement (personnages, reflets) sont rejetés. Le calage se fait directement sur l'image de référence, avec relais d'image en image quand les points de référence sortent du champ. |
-| Stabilisation | Verrouillée ou lissée, composantes activables, **zoom automatique** | Même logique que le stabilisateur de Resolve ou le Warp Stabilizer. |
+| Suivi long terme | **TAPNext++** | Suit les points sur des centaines d'images, gère les occultations et **retrouve** les points qui réapparaissent. |
+| Précision | **Affinage hybride** : flux optique Lucas-Kanade local sur l'image haute résolution, fusionné avec TAPNext++ par un filtre complémentaire | Sous-pixel, sans dérive. |
+| Mouvement | **Solveur RANSAC** : translation, position + rotation + échelle, ou **perspective** (surface plane) | Calage direct sur l'image de référence : un verrouillage reste exact même après 1 000 images. |
 
-Mesuré sur une vidéo de test au mouvement connu (rotation + translation) :
+- **Modèle** : *Position seule*, *Position + rotation + échelle* ou *Perspective* (surface plane : écran, mur, sol, panneau). La perspective utilise toujours les points TAPNext.
+- **Image de référence** : l'image que le verrouillage fige.
+- La **frise de temps** colore chaque image selon la qualité du calcul : vert < 0,7 px, jaune < 2 px, rouge au-delà.
+- **Insertion planaire** (modèle Perspective) : glissez les **4 coins orange** sur la surface à remplacer. Ils suivent la surface sur tout le plan.
 
-| | TAPNext++ seul | Hybride |
-|---|---|---|
-| Erreur sur le mouvement de caméra | 1,03 px | **0,33 px** |
-| Tremblement après stabilisation | 0,91 px/image | **0,05 px/image** |
-| Plan en perspective avec 30 % de points aberrants (modèle Perspective) | — | **0,19 px** |
-
-### Utilisation
-1. **① Suivi** : posez une zone de points sur le **décor** pour stabiliser la caméra, ou sur le **sujet ou la surface** à suivre. Laissez « Précision sous-pixel » coché, puis lancez le suivi.
-2. **③ Stabiliser** :
-   - **Points utilisés** : le groupe qui sert au calcul (par exemple « 1. Zone 1 » pour le décor).
-   - **Modèle** : *Position seule*, *Position + rotation + échelle* (caméra à l'épaule, la plupart des cas) ou *Perspective* (surface plane : écran, mur, sol, panneau).
-   - **Image de référence** : l'image que la stabilisation verrouille.
-   - **Lissage** : 0 = plan verrouillé. Une valeur de 10 à 40 garde le mouvement voulu et retire les tremblements.
-   - **Position / Rotation / Échelle** : ce qui est corrigé.
-   - **Zoom automatique** : agrandit juste assez pour qu'aucun bord noir n'apparaisse.
-   - **Aperçu stabilisé** : la vue montre directement le résultat. Les points doivent rester immobiles.
-   - La **frise de temps** colore chaque image selon la qualité du calcul : vert < 0,7 px, jaune < 2 px, rouge au-delà.
-3. **Insertion planaire** (modèle Perspective) : glissez les **4 coins orange** sur la surface à remplacer. Ils suivent la surface sur tout le plan.
-4. **⑤ Export → Nœuds Fusion** :
-   - **Stabilisation** : nœud `Transform`, ou `CornerPositioner` en perspective. Depuis Resolve, il peut être **branché directement** dans la comp du clip.
-   - **Match-move** : accroche un élément (texte, logo) au mouvement.
-   - **Insertion planaire** : un `CornerPositioner` sur les 4 coins. Branchez votre image d'insertion dessus, puis fusionnez-la sur le plan.
+### Export (onglet ⑤)
+- **Vidéo stabilisée** `_stabilized.mov`. Dans Resolve, page Edit : glissez-la sur le clip d'origine, puis choisissez **Replace**. Grâce au même timecode, elle se cale image pour image.
+- **Nœud Fusion Stabilisation** : `Transform`, ou `CornerPositioner` en perspective. Il peut être **branché directement** dans la comp du clip.
+- **Match-move** : accroche un élément (texte, logo) au mouvement.
+- **Insertion planaire** : un `CornerPositioner` sur les 4 coins.
 
 ---
 

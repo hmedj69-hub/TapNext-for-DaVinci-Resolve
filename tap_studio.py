@@ -64,6 +64,7 @@ import camera_solver as cs  # noqa: E402
 import depth_engine as de  # noqa: E402
 import motion_solver as ms  # noqa: E402
 import shape_engine as se  # noqa: E402
+import stabilizer as sb  # noqa: E402
 import tap_resolve_tool as eng  # noqa: E402
 import track_refine as trf  # noqa: E402
 
@@ -389,6 +390,30 @@ class DepthThread(QThread):
             self.failed.emit(f"{type(e).__name__} : {e}")
 
 
+class AnalyzeThread(QThread):
+    """Analyse du mouvement de toute l'image (stabilisation automatique)."""
+    progress = Signal(str, float)
+    done = Signal(object, object)
+    failed = Signal(str)
+
+    def __init__(self, store, t0, t1, exclude, key):
+        super().__init__()
+        self.store, self.t0, self.t1, self.exclude, self.key = store, t0, t1, exclude, key
+        self.cancel = threading.Event()
+
+    def run(self):
+        try:
+            info = self.store.info
+            m = sb.analyze(self.store.frame, self.t0, self.t1, info.width, info.height,
+                           exclude=self.exclude, progress=self.progress.emit, cancel=self.cancel)
+            self.done.emit(m, self.key)
+        except eng.Cancelled:
+            self.failed.emit("Analyse annulée.")
+        except Exception as e:
+            traceback.print_exc()
+            self.failed.emit(f"{type(e).__name__} : {e}")
+
+
 class CameraThread(QThread):
     """Solveur de caméra 3D (structure-from-motion sur les points suivis)."""
     progress = Signal(str, float)
@@ -429,7 +454,7 @@ class ExportThread(QThread):
             base = os.path.join(j["out_dir"], j["name"])
             outputs = []
             csv_path = base + "_tracks.csv"
-            if j["data"] or j.get("job_mode"):
+            if res is not None and (j["data"] or j.get("job_mode")):
                 self.progress.emit("Export des trajectoires", 0)
                 eng.export_csv(csv_path, rd.smoothed, res.visibility, rd.velocity, res.tracked)
                 params = dict(j["params"], query_frames=[int(v) for v in res.query_frames])
@@ -444,6 +469,15 @@ class ExportThread(QThread):
                                  quad=quad, name=node)
                 outputs.append(p)
                 j.setdefault("settings", {})[mode] = p
+            if j.get("stab_C") is not None:
+                # Vidéo stabilisée pleine résolution (même durée et timecode que la source).
+                p = sb.render_video(base, info, j["codec"], j["stab_C"],
+                                    progress=self.progress.emit, cancel=self.cancel)
+                outputs.append(p)
+                j["stabilized_video"] = p
+            if res is None:
+                self.done.emit(outputs)
+                return
             # Fichier de suivi pour l'effet OFX « TAPNext Shapes » de Resolve.
             tapfx = base + ".tapfx"
             se.export_tapfx(tapfx, res, j["point_groups"], info.width, info.height, info.fps,
@@ -1080,6 +1114,10 @@ class StudioWindow(QMainWindow):
         self.undo: List[int] = []
         self.default_style = load_default_style()
         self.solve = None            # solveur de mouvement (onglet ③)
+        self.motion = None           # analyse automatique du mouvement (onglet ③)
+        self.motion_key = None
+        self.analyze_thread: Optional[AnalyzeThread] = None
+        self.stab_info = None
         self.C = None                # correction de stabilisation par image
         self.zoom = 1.0
         self.quad_ref = None         # 4 coins (insertion planaire) sur l'image de référence
@@ -1185,7 +1223,8 @@ class StudioWindow(QMainWindow):
         self.tabs.addTab(self._scroll(self._tab_motion()), "③ Stabiliser")
         self.tabs.addTab(self._scroll(self._tab_3d()), "④ 3D")
         self.tabs.addTab(self._scroll(self._tab_export()), "⑤ Export")
-        self.tabs.currentChanged.connect(lambda _: (self._update_image(), self._refresh_overlay()))
+        self.tabs.currentChanged.connect(lambda i: (self._update_image(), self._refresh_overlay(),
+                                                    self._schedule_solve() if i == 2 else None))
         root.addWidget(self.tabs)
         self.statusBar().showMessage("Ouvrez une vidéo pour commencer.")
 
@@ -1400,15 +1439,23 @@ class StudioWindow(QMainWindow):
         g = QGroupBox("Mouvement à calculer")
         gl = QVBoxLayout(g)
         gl.addWidget(help_label(
-            "Pour <b>stabiliser la caméra</b>, utilisez un groupe de points posé sur le "
-            "<b>décor</b> (pas sur les personnages). Pour <b>suivre un sujet</b> ou une surface, "
-            "utilisez son groupe. Les points aberrants sont rejetés automatiquement (RANSAC)."))
+            "<b>Automatique</b> (recommandé pour stabiliser) : analyse de toute l'image, comme "
+            "le stabilisateur de Resolve — pas besoin de lancer le suivi. Les zones des sujets "
+            "suivis sont ignorées. Pour <b>suivre un sujet</b>, une surface ou verrouiller un "
+            "plan sans dérive, choisissez un groupe de points TAPNext."))
         row = QHBoxLayout()
-        row.addWidget(QLabel("Points utilisés"))
+        row.addWidget(QLabel("Mouvement de"))
         self.mo_group = QComboBox()
+        self.mo_group.addItem("Automatique : toute l'image (recommandé)", -2)
         self.mo_group.currentIndexChanged.connect(self._schedule_solve)
         row.addWidget(self.mo_group, 1)
         gl.addLayout(row)
+        self.st_excl = QCheckBox("Ignorer les sujets suivis (zones des groupes)")
+        self.st_excl.setChecked(True)
+        self.st_excl.setToolTip("Les personnages ou objets suivis dans l'onglet ① ne servent "
+                                "pas à mesurer le mouvement de la caméra")
+        self.st_excl.toggled.connect(self._schedule_solve)
+        gl.addWidget(self.st_excl)
         self.mo_model = QComboBox()
         self.mo_model.addItems(["Position seule (translation)", "Position + rotation + échelle",
                                 "Perspective (surface plane)"])
@@ -1426,17 +1473,27 @@ class StudioWindow(QMainWindow):
         b.clicked.connect(lambda: self.mo_ref.setValue(self.cur))
         row.addWidget(b)
         gl.addLayout(row)
-        self.lbl_solve = help_label("Lancez le suivi pour calculer le mouvement.")
+        self.lbl_solve = help_label("Ouvrez une vidéo pour analyser le mouvement.")
         gl.addWidget(self.lbl_solve)
         pv.addWidget(g)
 
         g = QGroupBox("Stabilisation")
         gl = QVBoxLayout(g)
-        self.st_smooth = ValueSlider("Lissage (0 = plan verrouillé)", 0, 120, 0, 1, "{:.0f}",
-                                     "0 : la caméra ne bouge plus du tout. Plus haut : seuls les "
-                                     "tremblements sont retirés, le mouvement voulu est conservé.")
+        self.st_mode = QComboBox()
+        self.st_mode.addItems(["Lisser : retire les tremblements, garde le mouvement voulu",
+                               "Verrouiller : caméra immobile (pied virtuel)"])
+        self.st_mode.currentIndexChanged.connect(self._schedule_solve)
+        gl.addWidget(self.st_mode)
+        self.st_smooth = ValueSlider("Force du lissage (images)", 2, 200, 30, 1, "{:.0f}",
+                                     "≈ durée (en images) des mouvements considérés comme des "
+                                     "tremblements. 30 ≈ 1 s : caméra à l'épaule très douce.")
         self.st_smooth.changed.connect(self._schedule_solve)
         gl.addWidget(self.st_smooth)
+        self.st_crop = ValueSlider("Recadrage maximal (%)", 0, 30, 10, 0.5, "{:.1f}",
+                                   "Limite du zoom. Là où la correction demanderait plus, elle "
+                                   "est adoucie localement au lieu de zoomer tout le plan.")
+        self.st_crop.changed.connect(self._schedule_solve)
+        gl.addWidget(self.st_crop)
         row = QHBoxLayout()
         self.st_pos, self.st_rot, self.st_scale = (QCheckBox("Position"), QCheckBox("Rotation"),
                                                    QCheckBox("Échelle"))
@@ -1459,7 +1516,7 @@ class StudioWindow(QMainWindow):
         gl.addWidget(help_label(
             "Avec le modèle <b>Perspective</b>, 4 coins orange apparaissent dans la vue : "
             "glissez-les sur la surface à remplacer (écran, panneau, mur…). Ils suivent la "
-            "surface sur tout le plan → nœud Fusion <i>CornerPositioner</i> (onglet ④)."))
+            "surface sur tout le plan → nœud Fusion <i>CornerPositioner</i> (onglet ⑤)."))
         b = QPushButton("Réinitialiser les coins")
         b.clicked.connect(self._reset_quad)
         gl.addWidget(b)
@@ -1473,54 +1530,157 @@ class StudioWindow(QMainWindow):
 
     def _solve_cols(self) -> Optional[np.ndarray]:
         gid = self.mo_group.currentData() if hasattr(self, "mo_group") else None
-        if gid is None or gid < 0:
+        if gid is None or gid < 0:  # -1 tous les points, -2 automatique
             return np.arange(self.n_tracked)
         return np.nonzero(self.pgroup[:self.n_tracked] == gid)[0]
 
     def motion_model(self) -> str:
         return ms.MODELS[self.mo_model.currentIndex()]
 
+    def _subject_polys(self, t: int):
+        """Zones des sujets suivis à l'image t (enveloppes convexes élargies)."""
+        if self.res is None or not self.n_tracked or not (0 <= t < len(self.res.tracked)):
+            return None
+        W = self.store.info.width
+        valid = se.valid_mask(self.res, np.arange(self.n_tracked))
+        out = []
+        for g in self.groups:
+            cols = np.nonzero(self.pgroup[:self.n_tracked] == g.id)[0]
+            if len(cols) < 3:
+                continue
+            ok = valid[t, cols] & (self.res.visibility[t, cols] >= 0.5)
+            pts = self.res.positions[t, cols][ok]
+            if len(pts) < 3:
+                continue
+            hull = cv2.convexHull(pts.astype(np.float32)).reshape(-1, 2).astype(float)
+            c = hull.mean(0)
+            d = hull - c
+            n = np.linalg.norm(d, axis=1, keepdims=True)
+            out.append(c + d * (1 + 0.04 * W / np.maximum(n, 1)))
+        return out
+
+    def _start_analysis(self, a: int, b: int, key):
+        if self.analyze_thread is not None or self._work_running():
+            self.lbl_solve.setText("Analyse en attente (un autre calcul est en cours)…")
+            QTimer.singleShot(1500, self._schedule_solve)
+            return
+        excl = None
+        if self.st_excl.isChecked() and self.res is not None:
+            excl = self._subject_polys
+        self.analyze_thread = AnalyzeThread(self.store, a, b, excl, key)
+        self.analyze_thread.progress.connect(
+            lambda d, f: self.lbl_solve.setText(f"{d}… {f * 100:.0f} %"))
+        self.analyze_thread.done.connect(self._on_analyzed)
+        self.analyze_thread.failed.connect(lambda m: self.lbl_solve.setText(m))
+        self.analyze_thread.finished.connect(self._analysis_finished)
+        self.lbl_solve.setText("Analyse du mouvement…")
+        self.analyze_thread.start()
+
+    def _on_analyzed(self, m, key):
+        self.motion, self.motion_key = m, key
+
+    def _analysis_finished(self):
+        self.analyze_thread = None
+        if self.motion is not None:
+            self._recompute_solve()
+
     def _recompute_solve(self):
-        self.solve, self.C = None, None
-        if self.res is None or not self.n_tracked or self.tracked_seg is None:
-            self.lbl_solve.setText("Lancez le suivi pour calculer le mouvement.")
-            self._update_image()
+        self.solve, self.C, self.stab_info = None, None, None
+        if not self.store or not self.store.complete:
+            self.lbl_solve.setText("Chargement de la vidéo…")
             return
-        cols = self._solve_cols()
-        a, b = self.tracked_seg
-        self.mo_ref.blockSignals(True)
-        self.mo_ref.setRange(a, b)
-        if not getattr(self, "_ref_user", False) and self.res.query_frames is not None:
-            # Par défaut : l'image où la plupart des points ont été posés.
-            vals, cnt = np.unique(self.res.query_frames, return_counts=True)
-            self.mo_ref.setValue(int(vals[np.argmax(cnt)]))
-        self.mo_ref.blockSignals(False)
-        if cols is None or len(cols) == 0:
-            self.lbl_solve.setText("Aucun point suivi dans ce groupe.")
-            self._update_image()
-            return
-        W, H = self.store.info.width, self.store.info.height
-        valid = se.valid_mask(self.res, np.arange(self.n_tracked)) & (self.res.visibility >= 0.5)
+        gid = self.mo_group.currentData()
         model = self.motion_model()
-        ref = self.mo_ref.value()
-        self.solve = ms.solve_motion(self.res.positions, valid, ref, a, b, model,
-                                     ransac_px=max(1.5, 0.0015 * max(W, H)), cols=cols)
-        st = ms.StabSettings(smooth=self.st_smooth.value(), position=self.st_pos.isChecked(),
-                             rotation=self.st_rot.isChecked(), scale=self.st_scale.isChecked(),
-                             zoom=self.st_zoom.isChecked())
-        self.C, self.zoom = ms.stabilize(self.solve, W, H, st)
+        W, H = self.store.info.width, self.store.info.height
+        auto = gid == -2 and model != "perspective"
+        self.st_excl.setEnabled(gid == -2)
+        self.st_smooth.setEnabled(self.st_mode.currentIndex() == 0)
+        if auto:
+            a, b = self.seg_in, self.seg_out
+            if b - a < 2:
+                self.lbl_solve.setText("Plage trop courte (réglez Début/Fin dans l'onglet ①).")
+                return
+            excl = self.st_excl.isChecked() and self.res is not None
+            key = (self.store.path, a, b, excl, self.res_version if excl else 0)
+            if self.motion is None or self.motion_key != key:
+                if self.tabs.currentIndex() == 2:
+                    self._start_analysis(a, b, key)
+                else:
+                    self.lbl_solve.setText("L'analyse démarre à l'ouverture de cet onglet.")
+                self._update_image()
+                return
+            m = self.motion
+            self.mo_ref.blockSignals(True)
+            self.mo_ref.setRange(a, b)
+            if not getattr(self, "_ref_user", False):
+                self.mo_ref.setValue((a + b) // 2)
+            self.mo_ref.blockSignals(False)
+            ref = self.mo_ref.value()
+            path = sb.path_from_motion(m, ref)
+            method = np.zeros(len(path), np.int8)
+            method[a:b + 1] = np.where(m.ok[a:b + 1], 2, 3)
+            method[a] = 2                     # 1re image : début de la trajectoire
+            method[ref] = 1
+            self.solve = ms.Solve(path, m.inliers, m.rms, method, ref, model, (a, b))
+        else:
+            if self.res is None or not self.n_tracked or self.tracked_seg is None:
+                self.lbl_solve.setText(
+                    "Ce mode utilise les points TAPNext : lancez d'abord le suivi (onglet ①)"
+                    + (", ou choisissez « Automatique »." if model != "perspective" else "."))
+                self._update_image()
+                return
+            cols = self._solve_cols()
+            a, b = self.tracked_seg
+            self.mo_ref.blockSignals(True)
+            self.mo_ref.setRange(a, b)
+            if not getattr(self, "_ref_user", False) and self.res.query_frames is not None:
+                # Par défaut : l'image où la plupart des points ont été posés.
+                vals, cnt = np.unique(self.res.query_frames, return_counts=True)
+                self.mo_ref.setValue(int(vals[np.argmax(cnt)]))
+            self.mo_ref.blockSignals(False)
+            if cols is None or len(cols) == 0:
+                self.lbl_solve.setText("Aucun point suivi dans ce groupe.")
+                self._update_image()
+                return
+            valid = se.valid_mask(self.res, np.arange(self.n_tracked)) & (self.res.visibility >= 0.5)
+            ref = self.mo_ref.value()
+            self.solve = ms.solve_motion(self.res.positions, valid, ref, a, b, model,
+                                         ransac_px=max(1.5, 0.0015 * max(W, H)), cols=cols)
+        lock = self.st_mode.currentIndex() == 1
+        if model == "perspective":
+            st = ms.StabSettings(smooth=0 if lock else self.st_smooth.value(),
+                                 position=self.st_pos.isChecked(), rotation=self.st_rot.isChecked(),
+                                 scale=self.st_scale.isChecked(), zoom=self.st_zoom.isChecked())
+            self.C, self.zoom = ms.stabilize(self.solve, W, H, st)
+        else:
+            trans = model == "translation"
+            prm = sb.StabParams(mode="lock" if lock else "smooth", smooth=self.st_smooth.value(),
+                                max_crop=self.st_crop.value() / 100.0,
+                                position=self.st_pos.isChecked(),
+                                rotation=self.st_rot.isChecked() and not trans,
+                                scale=self.st_scale.isChecked() and not trans,
+                                zoom=self.st_zoom.isChecked())
+            r = sb.stabilize(self.solve.H, W, H, prm, ref=self.solve.ref)
+            self.C, self.zoom, self.stab_info = r.C, r.zoom, r
         if self.quad_ref is None:
             self._reset_quad(redraw=False)
         sol = self.solve
         okm = sol.method[a:b + 1]
         rms = sol.rms[a:b + 1][okm > 0]
-        n_direct = int((okm == 1).sum())
         n_bad = int(((okm == 0) | (okm == 3)).sum())
-        self.lbl_solve.setText(
-            f"Erreur moyenne {np.nanmean(rms):.2f} px · calage direct sur {n_direct}/{len(okm)} images"
-            + (f" · {n_bad} image(s) sans solution" if n_bad else "")
-            + (f" · zoom ×{self.zoom:.3f}" if self.st_zoom.isChecked() else "")
-            + f"<br>{self._solve_frame_text(self.cur)}")
+        txt = f"Erreur moyenne {np.nanmean(rms) if np.isfinite(rms).any() else 0:.2f} px"
+        if not auto:
+            txt += f" · calage direct sur {int((okm == 1).sum())}/{len(okm)} images"
+        if n_bad:
+            txt += f" · {n_bad} image(s) sans solution"
+        if self.stab_info is not None and np.isfinite(self.stab_info.shake_before):
+            r = self.stab_info
+            n_red = int((r.strength[a:b + 1] < 0.98).sum())
+            txt += (f"<br><b>Tremblement : {r.shake_before:.2f} → {r.shake_after:.2f} px/image</b>"
+                    + (f" · correction adoucie sur {n_red} image(s) (limite de recadrage)" if n_red else ""))
+        if self.st_zoom.isChecked():
+            txt += f" · zoom ×{self.zoom:.3f}"
+        self.lbl_solve.setText(txt + f"<br>{self._solve_frame_text(self.cur)}")
         self._update_image()
         self._refresh_overlay()
         self.timeline.update()
@@ -1530,6 +1690,10 @@ class StudioWindow(QMainWindow):
         if sol is None or not (0 <= t < len(sol.H)) or not sol.ok(t):
             return f"Image {t} : pas de solution"
         how = {1: "calage direct", 2: "relais image par image", 3: "maintenu"}.get(int(sol.method[t]), "?")
+        if t == sol.ref:
+            return f"Image {t} : image de référence"
+        if not np.isfinite(sol.rms[t]):
+            return f"Image {t} : {how}"
         return f"Image {t} : {sol.inliers[t]} points retenus · erreur {sol.rms[t]:.2f} px · {how}"
 
     def _reset_quad(self, redraw=True):
@@ -1679,7 +1843,8 @@ class StudioWindow(QMainWindow):
 
     def _work_running(self) -> bool:
         return any(t is not None for t in (self.tracker_thread, self.export_thread,
-                                           self.depth_thread, self.camera_thread))
+                                           self.depth_thread, self.camera_thread,
+                                           getattr(self, "analyze_thread", None)))
 
     def start_camera(self):
         if self.res is None or not self.n_tracked or self.tracked_seg is None or self._work_running():
@@ -1850,6 +2015,11 @@ class StudioWindow(QMainWindow):
         self.cb_data = QCheckBox("Trajectoires CSV + JSON")
         self.cb_data.setChecked(True)
         gl.addWidget(self.cb_data)
+        self.cb_stab_video = QCheckBox("Vidéo stabilisée (rendu pleine résolution)")
+        self.cb_stab_video.setChecked(True)
+        self.cb_stab_video.setToolTip("Réglages dans l'onglet ③. Même durée et timecode que la "
+                                      "source : remplace le clip image pour image dans Resolve.")
+        gl.addWidget(self.cb_stab_video)
         gl.addWidget(QLabel("Nœuds Fusion (réglages dans l'onglet ③) :"))
         self.cb_fx_stab = QCheckBox("Stabilisation")
         self.cb_fx_stab.setChecked(True)
@@ -2037,7 +2207,7 @@ class StudioWindow(QMainWindow):
         self.cur = f
         self._update_image()
         if self.solve is not None and hasattr(self, "lbl_solve"):
-            txt = self.lbl_solve.text().split("<br>")[0]
+            txt = self.lbl_solve.text().rsplit("<br>", 1)[0]
             self.lbl_solve.setText(txt + "<br>" + self._solve_frame_text(f))
         self.frame_spin.blockSignals(True)
         self.frame_spin.setValue(f)
@@ -2137,13 +2307,14 @@ class StudioWindow(QMainWindow):
             cur_gid = self.mo_group.currentData()
             self.mo_group.blockSignals(True)
             self.mo_group.clear()
-            self.mo_group.addItem("Tous les points suivis", -1)
+            self.mo_group.addItem("Automatique : toute l'image (recommandé)", -2)
+            self.mo_group.addItem("Points TAPNext : tous les points suivis", -1)
             for i, g in enumerate(self.groups):
-                self.mo_group.addItem(f"{i + 1}. {g.name}", g.id)
+                self.mo_group.addItem(f"Points TAPNext : {i + 1}. {g.name}", g.id)
             j = self.mo_group.findData(cur_gid)
             self.mo_group.setCurrentIndex(j if j >= 0 else 0)
             self.mo_group.blockSignals(False)
-            if j < 0 and cur_gid not in (None, -1):
+            if j < 0 and cur_gid not in (None, -2):
                 self._schedule_solve()
         if hasattr(self, "cam_group"):
             cur_gid = self.cam_group.currentData()
@@ -2419,7 +2590,8 @@ class StudioWindow(QMainWindow):
         else:
             txt = f"{n} points · {n - nt} à suivre"
         self.lbl_points.setText(txt)
-        self.b_export.setEnabled(self.res is not None and self.export_thread is None)
+        self.b_export.setEnabled((self.res is not None or bool(self.store and self.store.complete))
+                                 and self.export_thread is None)
         self.b_track.setEnabled(n > nt and self.tracker_thread is None)
         if n > nt and nt:
             self.b_track.setText(f"▶  Suivre les {n - nt} nouveaux points")
@@ -2494,7 +2666,8 @@ class StudioWindow(QMainWindow):
         self._update_labels()
 
     def cancel_work(self):
-        for t in (self.tracker_thread, self.export_thread, self.depth_thread, self.camera_thread):
+        for t in (self.tracker_thread, self.export_thread, self.depth_thread, self.camera_thread,
+                  self.analyze_thread):
             if t is not None:
                 t.cancel.set()
 
@@ -2680,8 +2853,16 @@ class StudioWindow(QMainWindow):
 
     # ------------------------------------------------------------ export
     def start_export(self):
-        if self.res is None or self.export_thread is not None:
+        if self.export_thread is not None or not self.store:
             return
+        if self.res is None:
+            if self.C is None:
+                self._recompute_solve()
+            if self.C is None:
+                QMessageBox.warning(self, APP_NAME, "Rien à exporter : lancez le suivi (onglet ①) "
+                                    "ou la stabilisation (onglet ③).")
+                return
+            return self._start_export_stab_only()
         out_dir = self.out_edit.text().strip()
         name = self.name_edit.text().strip() or "tapnext"
         if not out_dir:
@@ -2692,7 +2873,8 @@ class StudioWindow(QMainWindow):
             # (écrasement impossible, ou ré-import refusé du même fichier).
             base, k = name, 2
             while any(os.path.exists(os.path.join(out_dir, name + suf))
-                      for suf in ("_matte.mov", "_matte.mp4", "_matte_png", ".tapfx")):
+                      for suf in ("_matte.mov", "_matte.mp4", "_matte_png", ".tapfx",
+                                  "_stabilized.mov", "_stabilized.mp4")):
                 name, k = f"{base}_v{k}", k + 1
         info = self.store.info
         if len(self.res.tracked) != self.store.total:
@@ -2709,6 +2891,7 @@ class StudioWindow(QMainWindow):
         cam = self.cam if (self.cam is not None and self.cam.mode != "échec"
                            and self.cb_cam3d.isChecked()) else None
         job = dict(
+            stab_C=self.C if (self.cb_stab_video.isChecked() and self.C is not None) else None,
             point_depth=None if self.point_depth is None else self.point_depth[:, :self.n_tracked],
             camera=cam, cam_valid=self._valid_tracked() if cam is not None else None,
             depth_clip=self.depth_clip if self.cb_depth_vid.isChecked() else None,
@@ -2731,6 +2914,41 @@ class StudioWindow(QMainWindow):
         )
         if not job["layers"]:
             QMessageBox.warning(self, APP_NAME, "Aucun groupe de points suivis à exporter.")
+            return
+        self.export_thread = ExportThread(job)
+        self.export_thread.progress.connect(self._on_progress)
+        self.export_thread.done.connect(lambda outs: self._on_exported(outs, job))
+        self.export_thread.failed.connect(self._on_failed)
+        self.export_thread.finished.connect(self._thread_finished)
+        self.b_export.setEnabled(False)
+        self.b_cancel.setEnabled(True)
+        self.prog_exp.setValue(0)
+        self.export_thread.start()
+
+    def _export_name(self, out_dir: str, name: str) -> str:
+        if self.job:
+            base, k = name, 2
+            while any(os.path.exists(os.path.join(out_dir, name + suf))
+                      for suf in ("_stabilized.mov", "_stabilized.mp4", "_stabilized_png",
+                                  "_matte.mov", ".tapfx")):
+                name, k = f"{base}_v{k}", k + 1
+        return name
+
+    def _start_export_stab_only(self):
+        """Export sans suivi TAPNext : vidéo stabilisée et nœuds Fusion."""
+        out_dir = self.out_edit.text().strip()
+        if not out_dir:
+            QMessageBox.warning(self, APP_NAME, "Choisissez un dossier de sortie.")
+            return
+        name = self._export_name(out_dir, self.name_edit.text().strip() or "tapnext")
+        job = dict(stab_C=self.C if self.cb_stab_video.isChecked() else None,
+                   fusion_jobs=self.fusion_jobs(), frames=list(range(self.seg_in, self.seg_out + 1)),
+                   info=self.store.info, res=None, rd=None, out_dir=out_dir, name=name,
+                   codec=["prores", "dnxhr", "h264", "png"][self.codec.currentIndex()],
+                   data=False, matte=False, ref_frame=self.seg_in, job_mode=bool(self.job),
+                   seg_in=int((self.job or {}).get("start", self.seg_in)))
+        if job["stab_C"] is None and not job["fusion_jobs"]:
+            QMessageBox.warning(self, APP_NAME, "Cochez « Vidéo stabilisée » ou un nœud Fusion.")
             return
         self.export_thread = ExportThread(job)
         self.export_thread.progress.connect(self._on_progress)
@@ -2768,6 +2986,7 @@ class StudioWindow(QMainWindow):
                         depth_video=next((o for o in outputs if "_depth" in os.path.basename(o)), ""),
                         wire_stabilize=self.cb_wire.isChecked(), attach=self.cb_attach.isChecked(),
                         tapfx=job.get("tapfx", ""),
+                        stabilized_video=job.get("stabilized_video", ""),
                         **{f"setting_{k}": v for k, v in job.get("settings", {}).items()})
             with open(self.job["done"], "w", encoding="utf-8") as f:
                 json.dump(done, f, ensure_ascii=False, indent=1)
@@ -2810,7 +3029,8 @@ class StudioWindow(QMainWindow):
                 "La matte sera attachée au clip et le nœud Fusion ajouté.")
 
     def closeEvent(self, e):
-        for t in (self.tracker_thread, self.export_thread, self.depth_thread, self.camera_thread):
+        for t in (self.tracker_thread, self.export_thread, self.depth_thread, self.camera_thread,
+                  self.analyze_thread):
             if t is not None:
                 t.cancel.set()
                 t.wait(3000)

@@ -94,6 +94,7 @@ struct Params {
   double smooth = 2.1;
   bool invert = true;
   bool showPoints = false;
+  double shapeW = 1.0, shapeH = 1.0;     // largeur / hauteur (× taille)
   // profondeur
   double depthScale = 0.0, depthNear = 0.0, depthFar = 1.0, depthFeather = 0.05, depthFog = 0.0;
   // ombre portée
@@ -404,6 +405,7 @@ void drawShape(Canvas& c, const Params& p, const Stamp* stamp, float cx, float c
   const int x0 = std::max(0, int(cx - R)), x1 = std::min(c.w - 1, int(cx + R));
   const int y0 = std::max(0, int(cy - R)), y1 = std::min(c.h - 1, int(cy + R));
   const float scale = std::max(0.5f, std::min(sx, sy));
+  const bool aniso = std::fabs(sx - sy) > 0.05f * std::max(sx, sy);
   for (int y = y0; y <= y1; ++y) {
     float* row = &c.v[size_t(y) * c.w];
     for (int x = x0; x <= x1; ++x) {
@@ -421,7 +423,18 @@ void drawShape(Canvas& c, const Params& p, const Stamp* stamp, float cx, float c
         cov = (s[iv * stamp->w + iu] * (1 - fu) + s[iv * stamp->w + iu1] * fu) * (1 - fv) +
               (s[iv1 * stamp->w + iu] * (1 - fu) + s[iv1 * stamp->w + iu1] * fu) * fv;
       } else {
-        float d = shapeSdf(p.shape == kImage ? kCircle : p.shape, lx, ly) * scale;
+        const int kind = p.shape == kImage ? kCircle : p.shape;
+        float d = shapeSdf(kind, lx, ly);
+        if (aniso) {
+          // Forme étirée : distance en pixels via le gradient (bords nets partout).
+          const float e = 0.5f;
+          float gx = (shapeSdf(kind, (ca * (dx + e) + sa * dy) / sx, (-sa * (dx + e) + ca * dy) / sy) - d) / e;
+          float gy = (shapeSdf(kind, (ca * dx + sa * (dy + e)) / sx, (-sa * dx + ca * (dy + e)) / sy) - d) / e;
+          float g = std::sqrt(gx * gx + gy * gy);
+          d = g > 1e-6f ? d / g : d * scale;
+        } else {
+          d *= scale;
+        }
         cov = std::min(1.f, std::max(0.f, 0.5f - d));
       }
       float val = cov * value;
@@ -522,7 +535,8 @@ void renderCore(const TrackFile& tf, const Prepared& pr, const Params& p, const 
         if (p.shadowDepth && finite(d)) dist *= 0.25f + 1.5f * (1.f - d);
         cx += ca * dist; cy += sa * dist;
       }
-      st.push_back({cx, cy, std::max(0.5f, r * s), std::max(0.5f, r), ang, al * (k ? fade : 1.f)});
+      st.push_back({cx, cy, std::max(0.5f, r * s * float(p.shapeW)), std::max(0.5f, r * float(p.shapeH)),
+                    ang, al * (k ? fade : 1.f)});
     }
   }
   Canvas m;
@@ -647,7 +661,7 @@ Instance* getInstance(OfxImageEffectHandle effect) {
   return static_cast<Instance*>(p);
 }
 
-std::string lastExportPath() {
+std::string lastPathFrom(const char* fileName) {
   std::string dir;
 #if defined(_WIN32)
   const wchar_t* a = _wgetenv(L"APPDATA");
@@ -660,7 +674,7 @@ std::string lastExportPath() {
   if (h) dir = std::string(h) + "/.config/TAPNext/";
 #endif
   if (dir.empty()) return "";
-  FilePtr f(uopen(dir + "last_tapfx.txt", "rb"));
+  FilePtr f(uopen(dir + fileName, "rb"));
   if (!f) return "";
   char buf[4096];
   size_t n = std::fread(buf, 1, sizeof(buf) - 1, f.get());
@@ -669,6 +683,8 @@ std::string lastExportPath() {
   while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' ')) line.pop_back();
   return line;
 }
+
+std::string lastExportPath() { return lastPathFrom("last_tapfx.txt"); }
 
 // Taille du fichier : détecte un nouvel export au même chemin.
 long long fileStamp(const std::string& path) {
@@ -740,7 +756,7 @@ void defGroup(OfxParamSetHandle ps, const char* name, const char* label, bool op
 }
 
 const char* kParamNames[] = {"file", "group", "offset", "output", "showPoints", "shape", "image",
-                             "size", "opacity", "rotation", "follow", "jitter", "grow", "stretch",
+                             "size", "shapeW", "shapeH", "opacity", "rotation", "follow", "jitter", "grow", "stretch",
                              "maxScale", "always", "fadeInOn", "fadeIn", "fadeOutOn", "fadeOut",
                              "merge", "threshold", "softness", "trail", "smooth", "invert",
                              "depthScale", "depthNear", "depthFar", "depthFeather", "depthFog",
@@ -766,6 +782,10 @@ void describeParams(OfxImageEffectHandle desc) {
   defString(ps, "image", "Image de forme (PNG)", true, "gShape",
             "Pour la forme « Image » : la transparence (ou la luminance) sert de forme");
   defDouble(ps, "size", "Taille (px)", 4.0, 0.5, 400.0, "gShape", "Rayon en pixels de la vidéo source");
+  defDouble(ps, "shapeW", "Largeur (×)", 1.0, 0.05, 10.0, "gShape",
+            "Étire la forme en largeur (rectangle, ellipse…)");
+  defDouble(ps, "shapeH", "Hauteur (×)", 1.0, 0.05, 10.0, "gShape",
+            "Étire la forme en hauteur");
   defDouble(ps, "opacity", "Opacité", 1.0, 0.0, 1.0, "gShape");
   defDouble(ps, "rotation", "Rotation (°)", 0.0, -180.0, 180.0, "gShape");
   defBool(ps, "follow", "Orienter dans le sens du mouvement", false, "gShape");
@@ -827,7 +847,7 @@ Params readParams(Instance* in, OfxTime t) {
   auto S = [&](const char* n, std::string& v) { char* s = nullptr; gParam->paramGetValueAtTime(in->params[n], t, &s); v = s ? s : ""; };
   S("file", p.file); I("group", p.group); I("offset", p.offset); I("output", p.output);
   B("showPoints", p.showPoints); I("shape", p.shape); S("image", p.image);
-  D("size", p.size); D("opacity", p.opacity); D("rotation", p.rotation); B("follow", p.follow);
+  D("size", p.size); D("shapeW", p.shapeW); D("shapeH", p.shapeH); D("opacity", p.opacity); D("rotation", p.rotation); B("follow", p.follow);
   D("jitter", p.jitter); D("grow", p.grow); D("stretch", p.stretch); D("maxScale", p.maxScale);
   B("always", p.always); B("fadeInOn", p.fadeInOn); I("fadeIn", p.fadeIn);
   B("fadeOutOn", p.fadeOutOn); I("fadeOut", p.fadeOut); D("merge", p.merge);
@@ -1124,7 +1144,12 @@ void setHost(OfxHost* h) { gHost = h; }
 
 OfxPlugin gPlugin = {kOfxImageEffectPluginApi, 1, kPluginId, 1, 0, setHost, mainEntry};
 
+// Second effet du même module : profondeur et temps appliqués à l'image.
+#include "TAPNextDepthTime.inc"
+
 }  // namespace
 
-TAP_EXPORT int OfxGetNumberOfPlugins(void) { return 1; }
-TAP_EXPORT OfxPlugin* OfxGetPlugin(int nth) { return nth == 0 ? &gPlugin : nullptr; }
+TAP_EXPORT int OfxGetNumberOfPlugins(void) { return 2; }
+TAP_EXPORT OfxPlugin* OfxGetPlugin(int nth) {
+  return nth == 0 ? &gPlugin : nth == 1 ? &dt::gPlugin2 : nullptr;
+}

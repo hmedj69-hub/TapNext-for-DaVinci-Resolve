@@ -56,7 +56,7 @@ OfxPropertySuiteV1 gPropSuite = {pSetPointer, pSetString, pSetDouble, pSetInt, p
                                  pGetPointer, pGetString, pGetDouble, pGetInt, pGetPointerN, pGetStringN, pGetDoubleN, pGetIntN, pReset, pGetDim};
 
 // --- paramètres
-struct Param { std::string type, name; PropSet props; std::string sval; double dval = 0; int ival = 0; };
+struct Param { std::string type, name; PropSet props; std::string sval; double dval = 0; int ival = 0; double rgb[3] = {0, 0, 0}; };
 struct ParamSet { std::map<std::string, std::unique_ptr<Param>> params; std::vector<std::string> order; PropSet props; };
 OfxStatus prmDefine(OfxParamSetHandle ps, const char* type, const char* name, OfxPropertySetHandle* props) {
   auto* s = reinterpret_cast<ParamSet*>(ps);
@@ -76,7 +76,8 @@ OfxStatus prmSetGetProps(OfxParamSetHandle ps, OfxPropertySetHandle* props) { *p
 OfxStatus prmGetProps(OfxParamHandle h, OfxPropertySetHandle* props) { *props = (OfxPropertySetHandle)&reinterpret_cast<Param*>(h)->props; return kOfxStatOK; }
 OfxStatus prmGetValueV(OfxParamHandle h, va_list ap) {
   auto* p = reinterpret_cast<Param*>(h);
-  if (p->type == kOfxParamTypeDouble) *va_arg(ap, double*) = p->dval;
+  if (p->type == kOfxParamTypeRGB) { for (int k = 0; k < 3; ++k) *va_arg(ap, double*) = p->rgb[k]; }
+  else if (p->type == kOfxParamTypeDouble) *va_arg(ap, double*) = p->dval;
   else if (p->type == kOfxParamTypeString) *va_arg(ap, char**) = (char*)p->sval.c_str();
   else *va_arg(ap, int*) = p->ival;
   return kOfxStatOK;
@@ -109,11 +110,29 @@ OfxStatus eClipGetHandle(OfxImageEffectHandle e, const char* name, OfxImageClipH
   auto* ef = reinterpret_cast<Effect*>(e); if (!ef->clips.count(name)) return kOfxStatErrUnknown;
   *c = (OfxImageClipHandle)ef->clips[name].get(); if (p) *p = (OfxPropertySetHandle)&ef->clips[name]->props; return kOfxStatOK;
 }
-OfxStatus eClipGetImage(OfxImageClipHandle c, OfxTime, const OfxRectD*, OfxPropertySetHandle* img) {
+// Source animée (TAP_MOVING=1) : dégradé + barre verticale qui se déplace.
+std::map<int, std::vector<float>> gFrames;
+float* movingFrame(int t) {
+  auto& f = gFrames[t];
+  if (f.empty()) {
+    f.assign((size_t)gW * gH * 4, 1.f);
+    int bx = (t * 15) % gW;
+    for (int y = 0; y < gH; ++y)
+      for (int x = 0; x < gW; ++x) {
+        float* p = &f[((size_t)y * gW + x) * 4];
+        p[0] = 0.15f + 0.5f * x / gW; p[1] = 0.15f + 0.5f * y / gH; p[2] = 0.3f;
+        if (std::abs(x - bx) < 12) p[0] = p[1] = p[2] = 1.f;
+      }
+  }
+  return f.data();
+}
+OfxStatus eClipGetImage(OfxImageClipHandle c, OfxTime t, const OfxRectD*, OfxPropertySetHandle* img) {
   auto* clip = reinterpret_cast<Clip*>(c);
   auto ps = std::make_unique<PropSet>();
   bool out = clip->name == kOfxImageEffectOutputClipName;
-  pSetPointer((OfxPropertySetHandle)ps.get(), kOfxImagePropData, 0, out ? gDst.data() : gSrc.data());
+  if (!out && t < 0) return kOfxStatFailed;
+  float* data = out ? gDst.data() : (getenv("TAP_MOVING") ? movingFrame((int)t) : gSrc.data());
+  pSetPointer((OfxPropertySetHandle)ps.get(), kOfxImagePropData, 0, data);
   pSetInt((OfxPropertySetHandle)ps.get(), kOfxImagePropRowBytes, 0, gW * 4 * 4);
   int b[4] = {0, 0, gW, gH};
   pSetIntN((OfxPropertySetHandle)ps.get(), kOfxImagePropBounds, 4, b);
@@ -149,7 +168,7 @@ int main(int argc, char** argv) {
   auto nb = (int (*)())dlsym(lib, "OfxGetNumberOfPlugins");
   auto get = (OfxPlugin * (*)(int)) dlsym(lib, "OfxGetPlugin");
   printf("plugins: %d\n", nb());
-  OfxPlugin* pl = get(0);
+  OfxPlugin* pl = get(getenv("TAP_PLUGIN") ? atoi(getenv("TAP_PLUGIN")) : 0);
   printf("id: %s v%u.%u api=%s\n", pl->pluginIdentifier, pl->pluginVersionMajor, pl->pluginVersionMinor, pl->pluginApi);
   PropSet hostProps;
   OfxHost host{(OfxPropertySetHandle)&hostProps, fetchSuite};
@@ -173,6 +192,8 @@ int main(int argc, char** argv) {
     ip->props = dp->props;
     if (dp->props.d.count(kOfxParamPropDefault)) ip->dval = dp->props.d[kOfxParamPropDefault][0];
     if (dp->props.i.count(kOfxParamPropDefault)) ip->ival = dp->props.i[kOfxParamPropDefault][0];
+    if (dp->type == kOfxParamTypeRGB)
+      for (int k = 0; k < 3; ++k) ip->rgb[k] = dp->props.d[kOfxParamPropDefault][k];
     if (dp->props.s.count(kOfxParamPropDefault)) ip->sval = dp->props.s[kOfxParamPropDefault][0];
   }
   for (auto& c : desc.clips) { auto cc = std::make_unique<Clip>(); cc->name = c.first; inst.clips[c.first] = std::move(cc); }
@@ -201,6 +222,19 @@ int main(int argc, char** argv) {
     for (int y = gH - 1; y >= 0; --y)  // OFX : origine en bas → PGM : haut
       for (int x = 0; x < gW; ++x) { float a = gDst[((size_t)y * gW + x) * 4 + 3]; fputc((int)(std::min(1.f, std::max(0.f, a)) * 255 + 0.5f), f); }
     fclose(f);
+    if (getenv("TAP_PPM")) {  // sortie couleur (RVB)
+      snprintf(fn, sizeof(fn), "%s_%04d.ppm", argv[3], (int)t);
+      FILE* g = fopen(fn, "wb"); fprintf(g, "P6\n%d %d\n255\n", gW, gH);
+      for (int y = gH - 1; y >= 0; --y)
+        for (int x = 0; x < gW; ++x)
+          for (int c = 0; c < 3; ++c) fputc((int)(std::min(1.f, std::max(0.f, gDst[((size_t)y * gW + x) * 4 + c])) * 255 + 0.5f), g);
+      fclose(g);
+    }
+    {
+      PropSet fa, fo; pSetDouble((OfxPropertySetHandle)&fa, kOfxPropTime, 0, t);
+      if (pl->mainEntry(kOfxImageEffectActionGetFramesNeeded, &inst, (OfxPropertySetHandle)&fa, (OfxPropertySetHandle)&fo) == kOfxStatOK)
+        printf("frames needed: [%g, %g]\n", fo.d["OfxImageClipPropFrameRange_Source"][0], fo.d["OfxImageClipPropFrameRange_Source"][1]);
+    }
     printf("render t=%g : %d → %s\n", t, st, fn);
   }
   pl->mainEntry(kOfxActionDestroyInstance, &inst, nullptr, nullptr);

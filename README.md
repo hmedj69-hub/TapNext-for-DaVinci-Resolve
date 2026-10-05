@@ -132,6 +132,27 @@ TAPNext++ convient bien à ce travail : ses pistes sont **longues** et survivent
 
 ---
 
+## 🌫️ Effet OFX « TAPNext Profondeur & Temps » (sur l'image, dans Resolve)
+
+Ce second effet agit **directement sur votre plan**, pas sur les masques.
+
+1. Dans Studio, onglet **④ 3D** : **Calculer la profondeur**. Le suivi n'est pas nécessaire, mais il améliore la stabilité de la profondeur. Ensuite, **Exportez** (onglet ⑤). Studio écrit un fichier `.tapdepth` et le mémorise comme « dernier export ».
+2. Dans Resolve, page **Color** : glissez **Effets → OpenFX → TAPNext → TAPNext Profondeur & Temps** sur un nœud. Le fichier de profondeur se remplit tout seul.
+
+| Section | Ce que ça fait |
+|---|---|
+| **Isoler une plage de profondeur** | La plage choisie (ex. de 0 à 0,3 = premier plan) sort dans l'**alpha** du nœud. Reliez cette sortie à l'entrée Key d'un nœud pour étalonner **seulement le premier plan** ou **seulement le fond** (option *Inverser*). Avec la sortie *Matte de la plage*, vous voyez la matte en N&B. |
+| **Brume / atmosphère** | Voile coloré qui augmente avec la distance (perspective atmosphérique, brouillard). |
+| **Flou de profondeur** | Mise au point virtuelle : *Distance nette* (0 = premier plan, 1 = fond), *Profondeur de champ*, *Flou maximal*. |
+| **Temps** | **Écho** : traînées des images précédentes, en mélange Moyenne, Plus clair ou Écran. **Slit-scan** horizontal, vertical ou radial : chaque zone de l'image montre un instant différent. **Time-slice selon la profondeur** : le premier plan et le fond ne sont pas au même instant. Option *Seulement dans la plage de profondeur*. |
+| **Mélange avec l'original** | Dose l'effet. |
+
+Sortie *Carte de profondeur* : la profondeur en N&B (blanc = proche).
+
+> Les effets de temps lisent les images voisines du clip. Comme pour tout effet temporel, le premier rendu d'une image est plus lent.
+
+---
+
 ## ✨ Effet OFX « TAPNext Shapes » (dans Resolve)
 
 L'installateur ajoute un **vrai effet OpenFX** dans DaVinci Resolve. Toutes les formes se règlent **dans l'Inspecteur de Resolve**, en direct, et l'alpha sort directement sur le nœud de la page Color.
@@ -143,7 +164,7 @@ L'installateur ajoute un **vrai effet OpenFX** dans DaVinci Resolve. Toutes les 
 | Section | Réglages |
 |---|---|
 | Suivi TAPNext | Fichier `.tapfx` · **Groupe** (numéro affiché dans la liste de Studio, 0 = tous les points) · Décalage d'image · Sortie · Afficher les points |
-| Forme | Forme (cercle, carré, carré arrondi, losange, triangle, hexagone, étoile, croix, anneau, image PNG) · image de forme · taille · opacité · rotation · orienter selon le mouvement · variation de taille |
+| Forme | Forme (cercle, carré, carré arrondi, losange, triangle, hexagone, étoile, croix, anneau, image PNG) · image de forme · taille · **largeur** · **hauteur** · opacité · rotation · orienter selon le mouvement · variation de taille |
 | Réaction au mouvement | Grossir avec la vitesse · étirer dans la direction · agrandissement maximal |
 | Apparition | **Toujours visible** · fondu d'apparition (activable, durée) · fondu de disparition (activable, durée) |
 | Fusion et bords | Fusion des formes · seuil · douceur |
@@ -189,6 +210,7 @@ Le panneau de droite a cinq onglets : **① Suivi**, **② Formes**, **③ Stabi
 | Forme | Forme | Cercle, carré, carré arrondi, losange, triangle, hexagone, étoile, croix, anneau, ou **votre image PNG** (sa transparence sert de forme). |
 | | Révéler / Découper | **Révéler** : la forme est blanche dans la matte. **Découper** : la forme perce un trou dans les autres groupes, ou dans une matte blanche s'il n'y a aucun groupe « Révéler ». |
 | | Taille, Opacité, Rotation | Taille en pixels de la vidéo source. |
+| | **Largeur / Hauteur** | Étirent la forme : un carré devient un rectangle, un cercle une ellipse. |
 | | Orienter dans le sens du mouvement | La forme tourne pour suivre la direction du point. |
 | | Variation aléatoire de taille | Chaque point reçoit une taille légèrement différente, pour un rendu organique. |
 | Réaction au mouvement | Grossir avec la vitesse | La forme grossit quand le point va vite. |

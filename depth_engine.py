@@ -158,12 +158,15 @@ def stabilize(disp: np.ndarray, first: int, positions: np.ndarray, valid: np.nda
         if inv_depth is not None and np.isfinite(inv_depth[t]).sum() >= 6:
             m = ok & np.isfinite(inv_depth[t])
             gains[i], offs[i] = _robust_affine(vals[m], inv_depth[t, m])
-        elif prev_vals is not None:
+        elif prev_vals is not None and (ok & prev_ok & np.isfinite(prev_vals)).sum() >= 6:
             m = ok & prev_ok & np.isfinite(prev_vals)
-            if m.sum() >= 6:
-                gains[i], offs[i] = _robust_affine(vals[m], prev_vals[m])
-            else:
-                gains[i], offs[i] = gains[i - 1], offs[i - 1]
+            gains[i], offs[i] = _robust_affine(vals[m], prev_vals[m])
+        elif i > 0:
+            # Pas (assez) de points suivis : calage robuste sur la carte précédente
+            # (grille de pixels ; les zones qui bougent sont rejetées par Huber).
+            a = disp[i, ::6, ::6].ravel().astype(np.float64)
+            b = (disp[i - 1, ::6, ::6].ravel() * gains[i - 1] + offs[i - 1]).astype(np.float64)
+            gains[i], offs[i] = _robust_affine(a, b)
         aligned = np.where(ok, gains[i] * vals + offs[i], np.nan)
         prev_vals, prev_ok = aligned, ok
     if smooth > 0 and n > 2:
@@ -249,3 +252,20 @@ def write_depth_video(out_base: str, info, codec: str, clip: DepthClip, n_total:
     finally:
         writer.close()
     return writer.path
+
+
+def export_tapdepth(path: str, clip: DepthClip, src_w: int, src_h: int) -> str:
+    """Fichier lu par l'effet OFX « TAPNext Profondeur & Temps » (voir
+    TAPNextDepthTime.inc) : cartes 0..1 (0 = proche) en uint16."""
+    import shape_engine as se
+
+    n, h, w = clip.depth01.shape
+    with open(path, "wb") as f:
+        f.write(b"TAPDEP01")
+        np.array([w, h, n, clip.first, src_w, src_h, 0, 0], "<i4").tofile(f)
+        np.array([clip.lo, clip.hi], "<f4").tofile(f)
+        for i in range(n):
+            d = np.clip(clip.depth01[i].astype(np.float32), 0, 1)
+            np.round(d * 65535).astype("<u2").tofile(f)
+    se.remember_last_tapfx(path, "last_tapdepth.txt")
+    return path

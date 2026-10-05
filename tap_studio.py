@@ -469,6 +469,15 @@ class ExportThread(QThread):
                                  quad=quad, name=node)
                 outputs.append(p)
                 j.setdefault("settings", {})[mode] = p
+            if j.get("depth_clip") is not None:
+                # Profondeur pour l'effet OFX « TAPNext Profondeur & Temps ».
+                p = de.export_tapdepth(base + ".tapdepth", j["depth_clip"], info.width, info.height)
+                outputs.append(p)
+                j["tapdepth"] = p
+                if j.get("depth_video"):
+                    outputs.append(de.write_depth_video(base, info, j["codec"], j["depth_clip"],
+                                                        j["n_total"], progress=self.progress.emit,
+                                                        cancel=self.cancel))
             if j.get("stab_C") is not None:
                 # Vidéo stabilisée pleine résolution (même durée et timecode que la source).
                 p = sb.render_video(base, info, j["codec"], j["stab_C"],
@@ -494,10 +503,6 @@ class ExportThread(QThread):
                 cs.write_json(base + "_camera.json", cam, j["frames"])
                 outputs += [p, base + "_points3d.ply", base + "_camera.json"]
                 j.setdefault("settings", {})["camera3d"] = p
-            if j.get("depth_clip") is not None:
-                outputs.append(de.write_depth_video(base, info, j["codec"], j["depth_clip"],
-                                                    len(res.tracked), progress=self.progress.emit,
-                                                    cancel=self.cancel))
             if j["matte"]:
                 outputs += se.write_shapes_video(
                     base, info, j["codec"], j["layers"], j["invert"], j["preview"],
@@ -580,6 +585,11 @@ class StyleEditor(QWidget):
         v.addWidget(self.mode)
         self.size = self._slider(v, "size", "Taille (px)", 1, 400, 0.5, "{:.1f}",
                                  "Rayon de chaque forme, en pixels de la vidéo source")
+        self.width = self._slider(v, "width", "Largeur (×)", 0.05, 10, 0.05, "{:.2f}",
+                                  "Étire la forme en largeur : un carré devient un rectangle, "
+                                  "un cercle une ellipse")
+        self.height = self._slider(v, "height", "Hauteur (×)", 0.05, 10, 0.05, "{:.2f}",
+                                   "Étire la forme en hauteur")
         self.opacity = self._slider(v, "opacity", "Opacité", 0, 1, 0.01, "{:.2f}")
         self.rotation = self._slider(v, "rotation", "Rotation (°)", -180, 180, 1, "{:.0f}")
         self.follow = self._check(v, "follow_motion", "Orienter dans le sens du mouvement")
@@ -718,7 +728,8 @@ class StyleEditor(QWidget):
         self._loading = True
         self.shape.setCurrentIndex(se.SHAPES.index(st.shape) if st.shape in se.SHAPES else 0)
         self.mode.setCurrentIndex(1 if st.mode == "subtract" else 0)
-        for w, k in ((self.size, "size"), (self.opacity, "opacity"), (self.rotation, "rotation"),
+        for w, k in ((self.size, "size"), (self.width, "width"), (self.height, "height"),
+                     (self.opacity, "opacity"), (self.rotation, "rotation"),
                      (self.jitter, "size_jitter"), (self.grow, "grow"), (self.stretch, "stretch"),
                      (self.max_scale, "max_scale"), (self.merge, "merge"), (self.thr, "threshold"),
                      (self.soft, "softness"), (self.trail, "trail"), (self.smooth, "smooth"),
@@ -1810,7 +1821,8 @@ class StudioWindow(QMainWindow):
         gl.addWidget(help_label(
             "Carte de profondeur par IA (Depth Anything V2) pour chaque image, <b>stabilisée</b> "
             "grâce aux points suivis (pas de scintillement) et, si la caméra 3D est résolue, "
-            "<b>calée sur la vraie géométrie</b>. Vue : « Profondeur »."))
+            "<b>calée sur la vraie géométrie</b>. Fonctionne aussi sans suivi (plage "
+            "Début/Fin). Vue : « Profondeur »."))
         self.b_depth = QPushButton("◐  Calculer la profondeur")
         self.b_depth.setObjectName("primary")
         self.b_depth.clicked.connect(self.start_depth)
@@ -1825,14 +1837,19 @@ class StudioWindow(QMainWindow):
         gl.addWidget(b)
         pv.addWidget(g)
 
-        g = QGroupBox("Jouer avec la profondeur")
+        g = QGroupBox("Utiliser la profondeur dans Resolve")
         gl = QVBoxLayout(g)
         gl.addWidget(help_label(
-            "Dans l'onglet ② Formes, chaque groupe a maintenant les sections "
-            "<b>Profondeur</b> (perspective, plage gardée, brume), <b>Ombre portée</b> et "
-            "<b>Écho temporel / slit-scan</b>. Les préréglages « Profondeur + ombre », "
-            "« Échos fantômes » et « Slit-scan » sont un bon départ. L'effet OFX de Resolve "
-            "reçoit aussi la profondeur."))
+            "<b>Sur votre plan</b> : exportez (onglet ⑤), puis dans Resolve posez l'effet "
+            "<b>OpenFX → TAPNext → TAPNext Profondeur &amp; Temps</b> sur un nœud de la page "
+            "Color. Il lit la profondeur tout seul et permet de :<br>"
+            "• <b>isoler une plage de profondeur</b> dans l'alpha → étalonner seulement le "
+            "premier plan ou seulement le fond ;<br>"
+            "• ajouter une <b>brume</b> ou un <b>flou de profondeur</b> (mise au point) ;<br>"
+            "• des effets de <b>temps</b> sur l'image : écho, slit-scan, time-slice selon la "
+            "profondeur.<br>"
+            "<b>Sur les masques</b> (en plus) : sections Profondeur, Ombre portée et Écho de "
+            "l'onglet ② Formes."))
         pv.addWidget(g)
         pv.addStretch(1)
         return panel
@@ -1871,7 +1888,21 @@ class StudioWindow(QMainWindow):
         self.camera_thread.start()
 
     def start_depth(self):
-        if self.res is None or not self.n_tracked or self.tracked_seg is None or self._work_running():
+        if not self.store or not self.store.complete or self._work_running():
+            return
+        if self.res is None or not self.n_tracked or self.tracked_seg is None:
+            # Sans suivi : plage Début/Fin, stabilisation sur les cartes elles-mêmes.
+            a, b = self.seg_in, self.seg_out
+            T = self.store.total
+            self.depth_thread = DepthThread(self.store, a, b, np.zeros((T, 0, 2), np.float32),
+                                            np.zeros((T, 0), bool), None)
+            self.depth_thread.progress.connect(self._on_progress_3d)
+            self.depth_thread.done.connect(self._on_depth)
+            self.depth_thread.failed.connect(self._on_failed_3d)
+            self.depth_thread.finished.connect(self._thread3d_finished)
+            self.prog_3d.setValue(0)
+            self._update_3d_buttons()
+            self.depth_thread.start()
             return
         a, b = self.tracked_seg
         inv = None
@@ -1914,7 +1945,7 @@ class StudioWindow(QMainWindow):
             return
         ok = self.res is not None and self.n_tracked > 0 and not self._work_running()
         self.b_cam.setEnabled(ok)
-        self.b_depth.setEnabled(ok)
+        self.b_depth.setEnabled(bool(self.store and self.store.complete) and not self._work_running())
 
     def _on_camera(self, r):
         self.prog_3d.setValue(1000)
@@ -2191,6 +2222,8 @@ class StudioWindow(QMainWindow):
             "Entourez le sujet avec l'outil Zone.", 15000)
         self.set_frame(self.cur, force=True)
         self.timeline.update()
+        self._update_3d_buttons()
+        self._update_labels()
 
     def _ask_outdir(self):
         d = QFileDialog.getExistingDirectory(self, "Dossier de sortie", self.out_edit.text())
@@ -2723,8 +2756,8 @@ class StudioWindow(QMainWindow):
 
     def _refresh_overlay(self):
         v = self.viewer
-        if (self.res is None or self.view_mode() == "points" or not self.store or self.stab_preview()
-                or self.tabs.currentIndex() == 2):
+        if ((self.res is None and self.view_mode() != "depth") or self.view_mode() == "points"
+                or not self.store or self.stab_preview() or self.tabs.currentIndex() == 2):
             v.overlay = None
             v.update()
             return
@@ -2858,9 +2891,9 @@ class StudioWindow(QMainWindow):
         if self.res is None:
             if self.C is None:
                 self._recompute_solve()
-            if self.C is None:
-                QMessageBox.warning(self, APP_NAME, "Rien à exporter : lancez le suivi (onglet ①) "
-                                    "ou la stabilisation (onglet ③).")
+            if self.C is None and self.depth_clip is None:
+                QMessageBox.warning(self, APP_NAME, "Rien à exporter : lancez le suivi (onglet ①), "
+                                    "la stabilisation (onglet ③) ou la profondeur (onglet ④).")
                 return
             return self._start_export_stab_only()
         out_dir = self.out_edit.text().strip()
@@ -2894,7 +2927,8 @@ class StudioWindow(QMainWindow):
             stab_C=self.C if (self.cb_stab_video.isChecked() and self.C is not None) else None,
             point_depth=None if self.point_depth is None else self.point_depth[:, :self.n_tracked],
             camera=cam, cam_valid=self._valid_tracked() if cam is not None else None,
-            depth_clip=self.depth_clip if self.cb_depth_vid.isChecked() else None,
+            depth_clip=self.depth_clip, depth_video=self.cb_depth_vid.isChecked(),
+            n_total=self.store.total,
             fusion_jobs=fusion_jobs, frames=list(range(self.seg_in, self.seg_out + 1)),
             info=info, res=self.res, rd=self.rd, pts=self.pts[:self.n_tracked],
             out_dir=out_dir, name=name,
@@ -2941,14 +2975,17 @@ class StudioWindow(QMainWindow):
             QMessageBox.warning(self, APP_NAME, "Choisissez un dossier de sortie.")
             return
         name = self._export_name(out_dir, self.name_edit.text().strip() or "tapnext")
-        job = dict(stab_C=self.C if self.cb_stab_video.isChecked() else None,
+        job = dict(stab_C=self.C if (self.cb_stab_video.isChecked() and self.C is not None) else None,
+                   depth_clip=self.depth_clip, depth_video=self.cb_depth_vid.isChecked(),
+                   n_total=self.store.total,
                    fusion_jobs=self.fusion_jobs(), frames=list(range(self.seg_in, self.seg_out + 1)),
                    info=self.store.info, res=None, rd=None, out_dir=out_dir, name=name,
                    codec=["prores", "dnxhr", "h264", "png"][self.codec.currentIndex()],
                    data=False, matte=False, ref_frame=self.seg_in, job_mode=bool(self.job),
                    seg_in=int((self.job or {}).get("start", self.seg_in)))
-        if job["stab_C"] is None and not job["fusion_jobs"]:
-            QMessageBox.warning(self, APP_NAME, "Cochez « Vidéo stabilisée » ou un nœud Fusion.")
+        if job["stab_C"] is None and not job["fusion_jobs"] and job["depth_clip"] is None:
+            QMessageBox.warning(self, APP_NAME, "Rien à exporter : stabilisation (onglet ③), "
+                                "profondeur (onglet ④) ou suivi (onglet ①).")
             return
         self.export_thread = ExportThread(job)
         self.export_thread.progress.connect(self._on_progress)
@@ -2987,6 +3024,7 @@ class StudioWindow(QMainWindow):
                         wire_stabilize=self.cb_wire.isChecked(), attach=self.cb_attach.isChecked(),
                         tapfx=job.get("tapfx", ""),
                         stabilized_video=job.get("stabilized_video", ""),
+                        tapdepth=job.get("tapdepth", ""),
                         **{f"setting_{k}": v for k, v in job.get("settings", {}).items()})
             with open(self.job["done"], "w", encoding="utf-8") as f:
                 json.dump(done, f, ensure_ascii=False, indent=1)

@@ -48,6 +48,8 @@ class ShapeStyle:
     image_path: str = ""
     mode: str = "add"                 # add = révèle (blanc) · subtract = découpe
     size: float = 4.0                 # rayon en pixels de la vidéo source
+    width: float = 1.0                # largeur (× taille) : rectangles, ellipses…
+    height: float = 1.0               # hauteur (× taille)
     rotation: float = 0.0             # degrés
     follow_motion: bool = False       # orientée dans le sens du mouvement
     opacity: float = 1.0
@@ -371,7 +373,8 @@ class ShapeRenderer:
                     if st.shadow_depth and np.isfinite(d):
                         dist *= 0.25 + 1.5 * (1.0 - d)
                     cx, cy = cx + ca * dist, cy + sa * dist
-                out.append((cx, cy, max(0.5, r * s), max(0.5, r), ang, al * (fade if k else 1.0)))
+                out.append((cx, cy, max(0.5, r * s * st.width), max(0.5, r * st.height), ang,
+                            al * (fade if k else 1.0)))
         out.sort(key=lambda e: e[5])
         return out
 
@@ -536,7 +539,7 @@ def export_tapfx(path: str, res: "eng.TrackResult", point_groups: np.ndarray,
     return path
 
 
-def last_tapfx_file() -> str:
+def last_tapfx_file(name: str = "last_tapfx.txt") -> str:
     """Fichier où l'on note le dernier export (lu par l'effet OFX quand son
     champ « Fichier de suivi » est vide)."""
     import os
@@ -547,13 +550,13 @@ def last_tapfx_file() -> str:
         base = os.path.expanduser("~/Library/Application Support/TAPNext")
     else:
         base = os.path.expanduser("~/.config/TAPNext")
-    return os.path.join(base, "last_tapfx.txt")
+    return os.path.join(base, name)
 
 
-def remember_last_tapfx(path: str) -> None:
+def remember_last_tapfx(path: str, name: str = "last_tapfx.txt") -> None:
     import os
     try:
-        f = last_tapfx_file()
+        f = last_tapfx_file(name)
         os.makedirs(os.path.dirname(f), exist_ok=True)
         with open(f, "w", encoding="utf-8") as fh:
             fh.write(os.path.abspath(path))

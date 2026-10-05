@@ -568,6 +568,12 @@ function M.import_results(resolve, root, job_text, done_text)
       report[#report + 1] = "✘ Import de la vidéo de profondeur impossible (" .. tostring(why) .. ") : " .. depth
     end
   end
+  local tapdepth = M.json_field(done_text, "tapdepth")
+  if tapdepth and tapdepth ~= "" then
+    report[#report + 1] = "✔ Profondeur prête pour l'effet OFX « TAPNext Profondeur & Temps » " ..
+      "(Effets → OpenFX → TAPNext, sur un nœud de la page Color) : plage de profondeur dans " ..
+      "l'alpha, brume, flou de profondeur, écho, slit-scan, time-slice."
+  end
   local tapfx = M.json_field(done_text, "tapfx")
   if tapfx and tapfx ~= "" then
     report[#report + 1] = "✔ Suivi prêt pour l'effet OFX « TAPNext Shapes » : Effets → OpenFX → " ..
